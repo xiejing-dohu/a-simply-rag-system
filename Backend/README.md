@@ -12,7 +12,7 @@ Vue 前端
   ▼
 FastAPI（app/main.py）
   ├─ JWT、角色、会话归属、Token 配额
-  ├─ Redis：Refresh Token、登录锁定、任务队列
+  ├─ Redis：Refresh Token、登录锁定、任务唤醒提示
   ├─ OpenAI-compatible /models 与 /chat/completions
   ├─ knowledge_repository.py ── SQLAlchemy async ── MySQL
   ├─ knowledge_runtime.py ───── 文档解析 / Embedding ── Milvus
@@ -30,7 +30,7 @@ Milvus ── etcd（内部元数据）+ MinIO（对象数据）
 | Token 累计和 5 小时/周窗口 | MySQL `users` | 保留 |
 | Refresh Token、失败锁定 | Redis | TTL 到期或主动吊销 |
 | 文档任务状态 | MySQL `document_tasks` | 保留并可恢复 |
-| 文档待处理队列 | Redis | AOF 持久化 |
+| 文档待处理队列 | MySQL `document_tasks` | 可靠队列、租约恢复 |
 | 知识库、Collection 映射 | MySQL `knowledge_bases` | 保留 |
 | 文档处理元信息 | MySQL `knowledge_documents` | 保留 |
 | 切片文本、字段、向量 | Milvus | 保留 |
@@ -46,14 +46,20 @@ Backend/
 ├── .env                         # 本地运行配置，不提交密钥
 ├── pyproject.toml               # uv 项目及依赖声明
 ├── uv.lock                      # 可复现依赖锁
-├── docker-compose.yml           # MySQL、etcd、MinIO、Milvus
+├── Dockerfile                   # API / Worker 共用运行镜像
+├── docker-compose.yml           # 数据服务、迁移、API、独立 Worker
+├── alembic.ini
+├── migrations/                  # Alembic 版本化数据库迁移
+├── tests/                       # HTTP 与 Worker 集成测试
 ├── README.md
 └── app/
     ├── main.py                  # 当前实际入口和全部 FastAPI 路由
     ├── state_repository.py      # 用户、会话、消息、Token MySQL 仓储
     ├── knowledge_repository.py  # MySQL 知识库/文档仓储和序列化
     ├── knowledge_runtime.py     # 解析、Token 切片、Embedding、Milvus CRUD
-    ├── document_tasks.py        # Redis 队列、任务恢复和异步 Worker
+    ├── document_tasks.py        # MySQL 租约、Redis 唤醒和异步入库
+    ├── vector_outbox.py         # Milvus Saga/Outbox Worker
+    ├── worker.py                # 独立 Worker 进程入口
     ├── db/
     │   ├── mysql.py             # SQLAlchemy 异步引擎和 Session
     │   ├── redis.py             # Redis 异步客户端
@@ -79,9 +85,12 @@ Backend/
 
 ## 3. 启动生命周期
 
-FastAPI `lifespan` 在启动时执行 `init_state_tables()`，创建用户、会话、消息、
-知识库、文档和任务表，并在首次运行时写入系统管理员。随后启动 Redis 文档
-Worker；服务停止时取消 Worker，并释放 Redis 与 SQLAlchemy 连接。
+数据库结构只通过 Alembic 管理。FastAPI 启动时校验数据库是否位于迁移 `head`，
+不再执行 `create_all` 或运行时 DDL；版本落后会停止并提示执行
+`uv run alembic upgrade head`。迁移完成后 API 只负责写入默认开发管理员。
+
+文档处理和 Milvus Outbox 由 `python -m app.worker` 独立运行。API 与 Worker 可
+分别扩容、重启；FastAPI 进程不会再消费后台任务。
 
 Milvus Collection 不在启动时全量重建；知识库通过 MySQL 中的
 `collection_name` 恢复与已有 Collection 的映射。
@@ -197,11 +206,12 @@ Token 按用户统计：
 支持 `.docx`、`.xlsx`、`.xls`、`.csv`、`.txt`、`.md` 和 `.pdf`，单文件最大
 30 MB。旧版 `.doc` 不受支持，需要先转换为 `.docx`。
 
-上传接口保存文件并返回 HTTP 202 和 `task_id`，Redis Worker 异步执行：
+上传接口保存文件并返回 HTTP 202 和 `task_id`，独立 Worker 异步执行：
 
 ```text
 管理员上传 multipart 文件 → MySQL 创建 document_tasks
-  → Redis 队列原子出队
+  → Redis 提示有新任务（提示丢失不影响可靠性）
+  → MySQL `FOR UPDATE SKIP LOCKED` 原子领取任务租约
   → 校验知识库、大小、扩展名、切片参数
   → 提取文本
   → Excel 拼接全部工作表、字段和数据行
@@ -213,8 +223,9 @@ Token 按用户统计：
   → 任务进度 100%，临时文件删除
 ```
 
-任务阶段和进度可通过 `GET /knowledge-bases/tasks/{task_id}` 查询。Worker 启动时
-会重新入队上次中断的 `queued/processing` 任务。
+任务阶段和进度可通过 `GET /knowledge-bases/tasks/{task_id}` 查询。Worker
+每 30 秒更新租约心跳；进程异常退出后，其他 Worker 会在租约过期后重新领取。
+`DOCUMENT_WORKER_CONCURRENCY` 控制单个 Worker 服务内的文档并发数。
 
 切片参数：
 
@@ -241,12 +252,19 @@ Milvus Collection 主要字段：
 
 ### 跨存储一致性
 
-创建知识库时先创建 Milvus Collection，再写 MySQL；若后续失败，后端尝试删除
-刚创建的 Collection。上传文档时先写 Milvus，再写 MySQL；如果 MySQL 提交失败，
-后端根据本次返回的主键删除已写入向量。
+知识库创建和删除采用 Saga + Transactional Outbox。业务状态和
+`vector_operations` 在同一个 MySQL 事务中提交，后台 Worker 直接轮询 MySQL，
+再幂等创建或删除 Milvus Collection：
 
-这是补偿式一致性，不是 MySQL 与 Milvus 的分布式事务。进程在两个操作之间被
-强制终止时仍可能产生孤立数据，生产环境需要任务表、幂等键和定期对账机制。
+- 创建：`creating → active`，Collection 创建成功后才允许上传和检索；
+- 删除：`active → deleting`，先停止新请求，等待已有文档任务结束，确认 Milvus
+  Collection 已删除后，才物理删除 MySQL 知识库及其级联记录；
+- 操作使用唯一幂等键、行锁领取、指数退避重试和进程中断恢复；
+- 每分钟对账 `active` 记录与 Collection；发现 Collection 丢失时标记
+  `inconsistent`，不会静默创建一个空集合掩盖数据丢失。
+
+MySQL 与 Milvus 仍不支持原生分布式事务，因此保证的是可恢复的最终一致性。
+文档切片写入目前仍使用写入失败后的主键补偿删除。
 
 ## 8. RAG 检索架构
 
@@ -278,15 +296,18 @@ Token 数、相关分数及是否被截断。Prompt 要求模型依据资料回�
 
 ## 9. 数据服务
 
-`docker-compose.yml` 只负责数据库相关服务，前后端仍在本机直接运行：
+`docker-compose.yml` 同时支持数据层和后端生产拓扑：
 
 | 服务 | 镜像/版本 | 本机端口 | 用途 |
 | --- | --- | --- | --- |
 | MySQL | `mysql:8.0` | 3306 | 业务元信息 |
-| Redis | `redis:7.4-alpine` | 6379 | 安全状态和任务队列 |
+| Redis | `redis:7.4-alpine` | 6379 | 安全状态和任务唤醒 |
 | Milvus | `milvusdb/milvus:v2.5.18` | 19530、9091 | Dense/Sparse 向量 |
 | etcd | `quay.io/coreos/etcd:v3.5.5` | 容器网络 | Milvus 元数据 |
 | MinIO | `minio/minio` | 9000、9001 | Milvus 对象存储 |
+| migrate | 项目镜像 | 无 | 一次性执行 Alembic |
+| api | 项目镜像 | 8000 | FastAPI，仅处理请求 |
+| worker | 项目镜像 | 无 | 文档和 Milvus Outbox |
 
 所有服务使用命名 Volume，并配置 `restart: unless-stopped`。
 
@@ -307,6 +328,7 @@ Token 数、相关分数及是否被截断。Prompt 要求模型依据资料回�
 | `DEFAULT_MODEL` | 默认聊天模型 | 必填 |
 | `EMBEDDING_MODEL` | 向量模型 | 必填 |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | Refresh Token 有效天数 | `7` |
+| `DOCUMENT_WORKER_CONCURRENCY` | 单个 Worker 文档并发数 | `2` |
 | `RERANK_PROVIDER` | `none` 或 `dashscope` | `none` |
 | `RERANK_MODEL` | 重排模型 | `qwen3-rerank` |
 | `RERANK_API_URL` | DashScope `/reranks` 地址 | 启用时必填 |
@@ -318,19 +340,35 @@ Compose 中 MySQL、Redis 和 MinIO 密码均从 `Backend/.env` 读取，不在�
 
 ## 11. 启动、检查与停止
 
-先启动数据服务：
+全部使用 Docker 启动时，迁移会先执行，成功后 API 和 Worker 才启动：
 
 ```powershell
 cd D:\智能rag系统\Backend
-docker compose up -d
+docker compose up -d --build
 docker compose ps
 ```
 
-再使用 uv 安装依赖并启动后端：
+本地使用 uv 开发时，先启动数据服务、执行迁移并启动 API：
 
 ```powershell
+docker compose up -d mysql redis etcd minio milvus
 uv sync
+uv run alembic upgrade head
 uv run uvicorn app.main:app --reload --port 8000
+```
+
+另开一个 PowerShell 启动独立 Worker：
+
+```powershell
+cd D:\智能rag系统\Backend
+uv run python -m app.worker
+```
+
+运行端到端与集成测试：
+
+```powershell
+uv run --group dev pytest -q
+uv run alembic check
 ```
 
 检查地址：
@@ -341,7 +379,7 @@ uv run uvicorn app.main:app --reload --port 8000
 - Milvus 健康检查：`http://localhost:9091/healthz`
 - MinIO 控制台：`http://localhost:9001`
 
-停止后端使用 `Ctrl+C`。停止数据容器但保留数据：
+本地 API 和 Worker 分别使用 `Ctrl+C` 停止。停止容器但保留数据：
 
 ```powershell
 docker compose stop
@@ -357,14 +395,14 @@ docker compose stop
 密码：admin123
 ```
 
-该账号仅用于本地开发，部署前必须替换认证实现与默认凭据。
+该账号仅用于本地开发，部署前必须修改默认密码和 `JWT_SECRET_KEY`。
 
 ## 12. 当前限制与下一步
 
-- 当前依靠 SQLAlchemy `create_all` 初始化，正式版本应使用 Alembic 管理迁移。
-- 文档 Worker 随 FastAPI 进程运行，高并发时应拆分为独立 Worker 部署。
-- 跨 MySQL/Milvus 只提供应用层补偿，不是原子事务。
+- 数据库现由 Alembic 管理，部署必须先执行 `alembic upgrade head`。
+- Worker 已独立部署，可通过副本数及 `DOCUMENT_WORKER_CONCURRENCY` 扩容。
+- 知识库生命周期使用 Saga/Outbox 最终一致性；切片入库仍使用补偿删除。
 - 旧 Collection 仍使用应用层 BM25；需重新建库并重传文档才能获得 Sparse 索引。
 - 上游 Embedding 账户额度耗尽时，上传和启用 RAG 的检索会返回 502。
-- 下一阶段应优先完成用户/会话/配额 MySQL 迁移、数据库迁移工具、后台任务队列、
-  幂等入库与集成测试。
+- 下一阶段应将切片主键改为客户端确定的稳定 ID 后使用 Milvus upsert，使文档
+  入库也具备完整 Outbox 幂等语义。

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.security import hash_password
-from app.db.mysql import Base, async_session_maker, engine
+from app.db.mysql import async_session_maker
 from app.models.conversation import Conversation
 from app.models.document_task import DocumentTask
 from app.models.knowledge_base import KnowledgeBase
@@ -20,14 +20,11 @@ ONE_WEEK = timedelta(days=7)
 
 
 def utcnow() -> datetime:
-    return datetime.utcnow()
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
-async def init_state_tables() -> None:
-    """Create runtime tables and seed the immutable local root administrator."""
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-
+async def seed_root_admin() -> None:
+    """Seed the immutable local root administrator after Alembic migration."""
     async with async_session_maker() as session:
         result = await session.execute(
             select(User).where(User.is_root_admin.is_(True)).limit(1)

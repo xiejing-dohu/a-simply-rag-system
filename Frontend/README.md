@@ -382,8 +382,9 @@ data: [DONE]
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
 | GET | `/knowledge-bases/` | 登录用户 | 获取知识库列表 |
-| POST | `/knowledge-bases/` | 管理员 | 创建 MySQL 记录和 Milvus Collection |
-| DELETE | `/knowledge-bases/{knowledge_base_id}` | 管理员 | 删除 Collection 和知识库记录 |
+| POST | `/knowledge-bases/` | 管理员 | HTTP 202，创建 MySQL + Milvus Outbox 任务 |
+| DELETE | `/knowledge-bases/{knowledge_base_id}` | 管理员 | HTTP 202，提交一致性删除任务 |
+| GET | `/knowledge-bases/operations/{operation_id}` | 管理员 | 查询 Milvus Outbox 操作 |
 
 创建请求：
 
@@ -410,10 +411,17 @@ data: [DONE]
   "vector_dimension": 1024,
   "file_count": 1,
   "chunk_count": 12,
+  "status": "active",
+  "generation": 1,
   "created_by": 1,
   "created_at": "2026-07-30T00:00:00"
 }
 ```
+
+`status` 可能是 `creating`、`active`、`deleting`、`create_failed`、
+`delete_failed` 或 `inconsistent`。前端只允许对 `active` 知识库执行上传、查看
+切片和 RAG 检索。创建和删除时前端轮询操作状态，只有 Milvus 与 MySQL 后续步骤
+全部成功才显示成功。
 
 ### 7.3 文档上传和文档列表
 

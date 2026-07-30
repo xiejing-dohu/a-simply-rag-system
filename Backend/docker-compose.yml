@@ -32,6 +32,11 @@ services:
       - "3306:3306"
     volumes:
       - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
     networks:
       - rag_network
 
@@ -102,6 +107,70 @@ services:
     networks:
       - rag_network
 
+  migrate:
+    build:
+      context: .
+    command: ["uv", "run", "--no-sync", "alembic", "upgrade", "head"]
+    env_file:
+      - .env
+    environment:
+      MYSQL_HOST: mysql
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      MILVUS_HOST: milvus
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - rag_network
+    restart: "no"
+
+  api:
+    build:
+      context: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MYSQL_HOST: mysql
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      MILVUS_HOST: milvus
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads_data:/app/data/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    networks:
+      - rag_network
+
+  worker:
+    build:
+      context: .
+    command: ["uv", "run", "--no-sync", "python", "-m", "app.worker"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MYSQL_HOST: mysql
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      MILVUS_HOST: milvus
+    volumes:
+      - uploads_data:/app/data/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    networks:
+      - rag_network
+
 networks:
   rag_network:
     driver: bridge
@@ -112,3 +181,4 @@ volumes:
   etcd_data:
   minio_data:
   milvus_data:
+  uploads_data:

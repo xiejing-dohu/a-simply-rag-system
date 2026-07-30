@@ -32,6 +32,10 @@ class DocumentTask(Base):
     )
     stage: Mapped[str] = mapped_column(String(50), nullable=False, default="queued")
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
     result_document_id: Mapped[int | None] = mapped_column(
         ForeignKey("knowledge_documents.id", ondelete="SET NULL"), nullable=True
     )

@@ -55,7 +55,7 @@
           class="kb-selector"
         >
           <el-option
-            v-for="kb in kbStore.knowledgeBases"
+            v-for="kb in activeKnowledgeBases"
             :key="kb.id"
             :label="`${kb.name} · ${kb.chunk_count} 切片`"
             :value="kb.id"
@@ -135,7 +135,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, watch, nextTick } from 'vue'
+import { computed, ref, onMounted, watch, nextTick } from 'vue'
 import { useChatStore } from '../stores/chat'
 import { useKnowledgeStore } from '../stores/knowledge'
 import type { Conversation } from '../types'
@@ -149,6 +149,9 @@ const kbStore = useKnowledgeStore()
 const inputMsg = ref('')
 const messagesArea = ref<HTMLElement | null>(null)
 const savingRag = ref(false)
+const activeKnowledgeBases = computed(() =>
+  kbStore.knowledgeBases.filter(item => item.status === 'active')
+)
 
 onMounted(() => {
   chatStore.fetchConversations()

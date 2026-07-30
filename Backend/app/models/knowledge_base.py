@@ -20,6 +20,11 @@ class KnowledgeBase(Base):
     vector_dimension: Mapped[int] = mapped_column(Integer, nullable=False)
     file_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     chunk_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", index=True
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_by: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()

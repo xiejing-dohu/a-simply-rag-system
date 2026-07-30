@@ -239,6 +239,11 @@ def drop_collection(collection_name: str) -> None:
         utility.drop_collection(collection_name)
 
 
+def collection_exists(collection_name: str) -> bool:
+    connect_milvus()
+    return bool(utility.has_collection(collection_name))
+
+
 async def embed_texts(texts: list[str], vector_dimension: int) -> list[list[float]]:
     api_key = os.getenv("OPENAI_API_KEY", "").strip() or os.getenv("DASHSCOPE_API_KEY", "").strip()
     api_base = os.getenv("OPENAI_API_BASE", "").strip().rstrip("/")

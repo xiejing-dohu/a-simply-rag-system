@@ -6,6 +6,7 @@ import {
   getEmbeddingConfig,
   getDocumentTask,
   getKnowledgeBases,
+  getVectorOperation,
   getMilvusChunks,
   getMilvusSchema,
   uploadDocument
@@ -42,12 +43,40 @@ export const useKnowledgeStore = defineStore('knowledge', () => {
       description,
       vector_dimension: vectorDimension
     })
-    knowledgeBases.value.push(res.data)
+    knowledgeBases.value.unshift(res.data)
+    for (let attempt = 0; attempt < 75; attempt++) {
+      if (res.data.status === 'active') return true
+      if (res.data.status === 'create_failed') {
+        throw new Error('Milvus 集合创建失败，请重试创建')
+      }
+      await new Promise(resolve => window.setTimeout(resolve, 800))
+      await fetchKnowledgeBases()
+      const current = knowledgeBases.value.find(item => item.id === res.data.id)
+      if (!current) throw new Error('知识库创建记录不存在')
+      res.data.status = current.status
+    }
+    return false
   }
 
   const deleteKnowledgeBaseAction = async (id: number) => {
-    await deleteKnowledgeBase(id)
+    const response = await deleteKnowledgeBase(id)
+    await fetchKnowledgeBases()
+    let operation = response.data.operation
+    for (let attempt = 0; attempt < 75; attempt++) {
+      if (operation.status === 'completed' || operation.status === 'failed') break
+      await new Promise(resolve => window.setTimeout(resolve, 800))
+      operation = (await getVectorOperation(operation.id)).data
+    }
+    if (operation.status === 'failed') {
+      await fetchKnowledgeBases()
+      throw new Error(operation.error || 'Milvus 集合删除失败，可点击删除重新提交')
+    }
+    if (operation.status !== 'completed') {
+      await fetchKnowledgeBases()
+      return false
+    }
     knowledgeBases.value = knowledgeBases.value.filter(kb => kb.id !== id)
+    return true
   }
 
   const uploadDocumentAction = async (

@@ -93,8 +93,22 @@ export interface KnowledgeBase {
   vector_dimension: number
   file_count: number
   chunk_count: number
+  status: 'creating' | 'active' | 'deleting' | 'create_failed' | 'delete_failed' | 'inconsistent'
+  generation: number
   created_by: number
   created_at: string
+}
+
+export interface VectorOperation {
+  id: string
+  operation_type: 'create_collection' | 'drop_collection'
+  resource_id: number
+  status: 'pending' | 'processing' | 'retry' | 'completed' | 'failed' | 'cancelled'
+  attempts: number
+  max_attempts: number
+  error: string | null
+  created_at: string
+  completed_at: string | null
 }
 
 export interface EmbeddingConfig {

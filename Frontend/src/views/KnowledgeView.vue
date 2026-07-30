@@ -18,10 +18,18 @@
       <div v-for="kb in kbStore.knowledgeBases" :key="kb.id" class="kb-card glass-card slide-up">
         <div class="kb-header">
           <h3>{{ kb.name }}</h3>
-          <el-button v-if="authStore.isAdmin" type="danger" link @click="handleDelete(kb.id)">
+          <el-button
+            v-if="authStore.isAdmin && kb.status !== 'deleting'"
+            type="danger"
+            link
+            @click="handleDelete(kb.id)"
+          >
             <el-icon><Delete /></el-icon>
           </el-button>
         </div>
+        <el-tag :type="statusTagType(kb.status)" size="small">
+          {{ statusText[kb.status] || kb.status }}
+        </el-tag>
         <p class="kb-desc">{{ kb.description || '无描述' }}</p>
         <div class="model-line">
           <el-tag size="small" effect="plain">{{ kb.embedding_model }}</el-tag>
@@ -32,10 +40,23 @@
           <span>{{ kb.chunk_count }} 个切片</span>
         </div>
         <div class="kb-actions">
-          <el-button v-if="authStore.isAdmin" type="primary" plain size="small" @click="openUpload(kb)">
+          <el-button
+            v-if="authStore.isAdmin"
+            type="primary"
+            plain
+            size="small"
+            :disabled="kb.status !== 'active'"
+            @click="openUpload(kb)"
+          >
             上传并向量化
           </el-button>
-          <el-button size="small" @click="openMilvusData(kb)">查看 Milvus 数据</el-button>
+          <el-button
+            size="small"
+            :disabled="kb.status !== 'active'"
+            @click="openMilvusData(kb)"
+          >
+            查看 Milvus 数据
+          </el-button>
         </div>
       </div>
     </div>
@@ -221,6 +242,19 @@ const stageNames: Record<string, string> = {
   completed: '处理完成',
   failed: '处理失败'
 }
+const statusText: Record<string, string> = {
+  creating: '创建中',
+  active: '可用',
+  deleting: '删除中',
+  create_failed: '创建失败',
+  delete_failed: '删除失败',
+  inconsistent: '数据不一致'
+}
+const statusTagType = (status: string) => {
+  if (status === 'active') return 'success'
+  if (status.endsWith('failed')) return 'danger'
+  return 'warning'
+}
 const taskStageText = computed(() =>
   stageNames[uploadTask.value?.stage || 'queued'] || '处理中'
 )
@@ -243,11 +277,19 @@ const handleCreate = async () => {
   if (!form.name.trim()) return ElMessage.warning('请输入名称')
   creating.value = true
   try {
-    await kbStore.createKnowledgeBase(form.name.trim(), form.description, form.vectorDimension)
+    const completed = await kbStore.createKnowledgeBase(
+      form.name.trim(),
+      form.description,
+      form.vectorDimension
+    )
     dialogVisible.value = false
     form.name = ''
     form.description = ''
-    ElMessage.success('知识库和 Milvus 集合创建成功')
+    if (completed) {
+      ElMessage.success('知识库和 Milvus 集合创建成功')
+    } else {
+      ElMessage.info('创建任务仍在后台重试，可通过状态标签查看进度')
+    }
   } catch (error) {
     ElMessage.error(errorMessage(error, '创建失败'))
   } finally {
@@ -260,8 +302,12 @@ const handleDelete = async (id: number) => {
     await ElMessageBox.confirm('将同时删除 Milvus 集合及其中的全部向量，是否继续？', '删除知识库', {
       type: 'warning'
     })
-    await kbStore.deleteKnowledgeBase(id)
-    ElMessage.success('删除成功')
+    const completed = await kbStore.deleteKnowledgeBase(id)
+    if (completed) {
+      ElMessage.success('Milvus 与 MySQL 记录均已删除')
+    } else {
+      ElMessage.info('删除任务仍在后台重试，知识库已停止使用')
+    }
   } catch (error) {
     if (error !== 'cancel') ElMessage.error(errorMessage(error, '删除失败'))
   }

@@ -5,7 +5,8 @@ import type {
   KnowledgeBase,
   KnowledgeDocument,
   MilvusChunkPage,
-  MilvusSchema
+  MilvusSchema,
+  VectorOperation
 } from '../types'
 
 export const getEmbeddingConfig = () => {
@@ -25,7 +26,13 @@ export const createKnowledgeBase = (data: {
 }
 
 export const deleteKnowledgeBase = (id: number) => {
-  return request.delete(`/knowledge-bases/${id}`)
+  return request.delete<{ status: string, operation: VectorOperation }>(
+    `/knowledge-bases/${id}`
+  )
+}
+
+export const getVectorOperation = (operationId: string) => {
+  return request.get<VectorOperation>(`/knowledge-bases/operations/${operationId}`)
 }
 
 export const uploadDocument = (

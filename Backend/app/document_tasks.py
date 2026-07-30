@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from redis.exceptions import RedisError
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from app.db.mysql import async_session_maker
 from app.db.redis import redis_client
@@ -24,6 +24,12 @@ from app.models.document_task import DocumentTask
 QUEUE_KEY = "documents:queue"
 UPLOAD_ROOT = Path(__file__).resolve().parents[1] / "data" / "uploads"
 MAX_FILE_SIZE = 30 * 1024 * 1024
+TASK_LEASE_TIMEOUT = timedelta(minutes=2)
+HEARTBEAT_INTERVAL_SECONDS = 30
+
+
+def utcnow() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def serialize_task(item: DocumentTask) -> dict[str, Any]:
@@ -37,6 +43,7 @@ def serialize_task(item: DocumentTask) -> dict[str, Any]:
         "status": item.status,
         "stage": item.stage,
         "progress": item.progress,
+        "attempts": item.attempts,
         "result_document_id": item.result_document_id,
         "error": item.error,
         "created_at": item.created_at.isoformat(),
@@ -121,13 +128,67 @@ async def _set_task(task_id: str, **changes: Any) -> None:
             return
         for key, value in changes.items():
             setattr(item, key, value)
+        if item.status == "processing":
+            item.heartbeat_at = utcnow()
         await session.commit()
+
+
+async def claim_task(task_id: str | None = None) -> str | None:
+    """Atomically claim a queued task or reclaim an expired processing lease."""
+
+    now = utcnow()
+    stale_before = now - TASK_LEASE_TIMEOUT
+    eligible = or_(
+        DocumentTask.status == "queued",
+        and_(
+            DocumentTask.status == "processing",
+            or_(
+                DocumentTask.heartbeat_at.is_(None),
+                DocumentTask.heartbeat_at <= stale_before,
+            ),
+        ),
+    )
+    async with async_session_maker() as session:
+        statement = (
+            select(DocumentTask)
+            .where(eligible)
+            .order_by(DocumentTask.created_at.asc())
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        )
+        if task_id is not None:
+            statement = statement.where(DocumentTask.id == task_id)
+        result = await session.execute(statement)
+        task = result.scalar_one_or_none()
+        if task is None:
+            return None
+        task.status = "processing"
+        task.stage = "parsing"
+        task.progress = 10
+        task.attempts += 1
+        task.heartbeat_at = now
+        task.started_at = task.started_at or now
+        task.finished_at = None
+        task.error = None
+        await session.commit()
+        return task.id
+
+
+async def _heartbeat(task_id: str) -> None:
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+        async with async_session_maker() as session:
+            task = await session.get(DocumentTask, task_id)
+            if task is None or task.status != "processing":
+                return
+            task.heartbeat_at = utcnow()
+            await session.commit()
 
 
 async def process_task(task_id: str) -> None:
     async with async_session_maker() as session:
         task = await session.get(DocumentTask, task_id)
-        if task is None or task.status == "completed":
+        if task is None or task.status != "processing":
             return
         payload = {
             "knowledge_base_id": task.knowledge_base_id,
@@ -142,15 +203,8 @@ async def process_task(task_id: str) -> None:
 
     primary_keys: list[int] = []
     path = Path(payload["temp_path"])
+    heartbeat = asyncio.create_task(_heartbeat(task_id))
     try:
-        await _set_task(
-            task_id,
-            status="processing",
-            stage="parsing",
-            progress=10,
-            started_at=datetime.utcnow(),
-            error=None,
-        )
         knowledge_base = await get_knowledge_base(payload["knowledge_base_id"])
         if knowledge_base is None:
             raise LookupError("知识库不存在")
@@ -210,7 +264,8 @@ async def process_task(task_id: str) -> None:
             stage="completed",
             progress=100,
             result_document_id=document.id,
-            finished_at=datetime.utcnow(),
+            finished_at=utcnow(),
+            heartbeat_at=None,
         )
     except Exception as exc:
         await _set_task(
@@ -218,36 +273,41 @@ async def process_task(task_id: str) -> None:
             status="failed",
             stage="failed",
             error=(str(exc) or exc.__class__.__name__)[:4000],
-            finished_at=datetime.utcnow(),
+            finished_at=utcnow(),
+            heartbeat_at=None,
         )
     finally:
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat
         with suppress(OSError):
             path.unlink(missing_ok=True)
 
 
-async def recover_tasks() -> None:
-    """Requeue tasks left queued/processing by an interrupted application process."""
-    async with async_session_maker() as session:
-        result = await session.execute(
-            select(DocumentTask.id).where(
-                DocumentTask.status.in_(["queued", "processing"])
-            )
-        )
-        for task_id in result.scalars():
-            await redis_client.rpush(QUEUE_KEY, task_id)
-
-
 async def document_worker(stop_event: asyncio.Event) -> None:
-    try:
-        await recover_tasks()
-    except RedisError:
-        return
+    """Use Redis as a wake-up hint and MySQL as the durable source of truth."""
+
     while not stop_event.is_set():
+        hinted_task_id: str | None = None
         try:
-            result = await redis_client.blpop(QUEUE_KEY, timeout=2)
+            result = await redis_client.blpop(QUEUE_KEY, timeout=1)
             if result:
-                await process_task(result[1])
+                hinted_task_id = result[1]
         except asyncio.CancelledError:
             raise
         except RedisError:
+            pass
+        claimed_task_id = None
+        try:
+            if hinted_task_id is not None:
+                claimed_task_id = await claim_task(hinted_task_id)
+            if claimed_task_id is None:
+                claimed_task_id = await claim_task()
+            if claimed_task_id is not None:
+                await process_task(claimed_task_id)
+            else:
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
             await asyncio.sleep(1)

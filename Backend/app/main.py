@@ -25,20 +25,20 @@ from app.knowledge_runtime import (
     EmbeddingServiceError,
     KnowledgeProcessingError,
     collection_details,
-    create_collection,
-    drop_collection,
     embedding_config,
     list_chunks,
 )
 from app.knowledge_repository import (
     close_knowledge_database,
     create_knowledge_base_record,
-    delete_knowledge_base_record,
     get_knowledge_base,
+    get_vector_operation,
     list_documents,
     list_knowledge_bases,
+    request_knowledge_base_deletion,
     serialize_document,
     serialize_knowledge_base,
+    serialize_vector_operation,
 )
 from app.core.config import settings
 from app.core.security import (
@@ -50,9 +50,9 @@ from app.core.security import (
     verify_token,
 )
 from app.db.redis import close_redis, redis_client
+from app.db.migrations import assert_database_at_head
 from app.document_tasks import (
     create_task as create_document_task,
-    document_worker,
     enqueue_task,
     get_task as get_document_task_record,
     save_upload,
@@ -67,7 +67,7 @@ from app.state_repository import (
     get_owned_conversation,
     get_user,
     get_user_by_username,
-    init_state_tables,
+    seed_root_admin,
     list_conversations,
     list_messages,
     list_users,
@@ -167,18 +167,11 @@ class KnowledgeBaseCreate(BaseModel):
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await init_state_tables()
-    worker_stop = asyncio.Event()
-    worker = asyncio.create_task(document_worker(worker_stop))
+    await assert_database_at_head()
+    await seed_root_admin()
     try:
         yield
     finally:
-        worker_stop.set()
-        worker.cancel()
-        try:
-            await worker
-        except asyncio.CancelledError:
-            pass
         await close_redis()
         await close_knowledge_database()
 
@@ -823,7 +816,7 @@ async def get_knowledge_bases(_: Annotated[dict, Depends(current_user)]):
     return [serialize_knowledge_base(item) for item in items]
 
 
-@app.post("/knowledge-bases/")
+@app.post("/knowledge-bases/", status_code=202)
 async def create_knowledge_base(
     data: KnowledgeBaseCreate, user: Annotated[dict, Depends(admin_user)]
 ):
@@ -835,7 +828,6 @@ async def create_knowledge_base(
         )
     collection_name = f"kb_{uuid.uuid4().hex}"
     try:
-        await asyncio.to_thread(create_collection, collection_name, data.vector_dimension)
         knowledge_base = await create_knowledge_base_record(
             name=data.name,
             description=data.description or "",
@@ -845,27 +837,28 @@ async def create_knowledge_base(
             created_by=user.id,
         )
     except Exception as exc:
-        try:
-            await asyncio.to_thread(drop_collection, collection_name)
-        except Exception:
-            pass
-        raise HTTPException(status_code=503, detail=f"创建 Milvus 集合失败: {exc}") from exc
+        raise HTTPException(status_code=503, detail=f"创建知识库任务失败: {exc}") from exc
     return serialize_knowledge_base(knowledge_base)
 
 
-@app.delete("/knowledge-bases/{knowledge_base_id}")
+@app.delete("/knowledge-bases/{knowledge_base_id}", status_code=202)
 async def delete_knowledge_base(
     knowledge_base_id: int, _: Annotated[dict, Depends(admin_user)]
 ):
-    knowledge_base = await get_knowledge_base(knowledge_base_id)
-    if not knowledge_base:
+    operation = await request_knowledge_base_deletion(knowledge_base_id)
+    if operation is None:
         raise HTTPException(status_code=404, detail="知识库不存在")
-    try:
-        await asyncio.to_thread(drop_collection, knowledge_base.collection_name)
-        await delete_knowledge_base_record(knowledge_base_id)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"删除 Milvus 集合失败: {exc}") from exc
-    return {"status": "success"}
+    return {"status": "accepted", "operation": serialize_vector_operation(operation)}
+
+
+@app.get("/knowledge-bases/operations/{operation_id}")
+async def get_knowledge_operation(
+    operation_id: str, _: Annotated[dict, Depends(admin_user)]
+):
+    operation = await get_vector_operation(operation_id)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="向量操作不存在")
+    return serialize_vector_operation(operation)
 
 
 @app.post("/knowledge-bases/{knowledge_base_id}/documents/", status_code=202)
@@ -897,11 +890,13 @@ async def upload_document(
             chunk_tokens=chunk_tokens,
             overlap_tokens=overlap_tokens,
         )
-        await enqueue_task(task.id)
+        try:
+            await enqueue_task(task.id)
+        except RedisError:
+            # MySQL is the durable queue; Redis only wakes the worker sooner.
+            pass
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RedisError as exc:
-        raise HTTPException(status_code=503, detail="文档任务队列暂不可用") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"创建文档任务失败: {exc}") from exc
 

@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     REDIS_URL: str = "redis://127.0.0.1:6379/0"
+    DOCUMENT_WORKER_CONCURRENCY: int = 2
     
     OPENAI_API_KEY: str
     OPENAI_API_BASE: str
