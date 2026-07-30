@@ -1,0 +1,32 @@
+# Secrets and local environment
+Backend/.env
+Frontend/.env
+Frontend/.env.*
+!Backend/.env.example
+!Frontend/.env.example
+
+# Python
+Backend/.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.uv-cache/
+
+# Node / Vite
+Frontend/node_modules/
+Frontend/dist/
+Frontend/dist-ssr/
+
+# Logs and local data
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
