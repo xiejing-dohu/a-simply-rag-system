@@ -4,6 +4,7 @@ import {
   createKnowledgeBase,
   deleteKnowledgeBase,
   getEmbeddingConfig,
+  getDocumentTask,
   getKnowledgeBases,
   getMilvusChunks,
   getMilvusSchema,
@@ -11,8 +12,8 @@ import {
 } from '../api/knowledge'
 import type {
   EmbeddingConfig,
+  DocumentTask,
   KnowledgeBase,
-  KnowledgeDocument,
   MilvusChunkPage,
   MilvusSchema
 } from '../types'
@@ -54,9 +55,14 @@ export const useKnowledgeStore = defineStore('knowledge', () => {
     file: File,
     chunkTokens: number,
     overlapTokens: number
-  ): Promise<KnowledgeDocument> => {
+  ): Promise<DocumentTask> => {
     const res = await uploadDocument(kbId, file, chunkTokens, overlapTokens)
-    return res.data.document
+    return res.data.task
+  }
+
+  const fetchDocumentTask = async (taskId: string): Promise<DocumentTask> => {
+    const res = await getDocumentTask(taskId)
+    return res.data
   }
 
   const fetchMilvusSchema = async (kbId: number): Promise<MilvusSchema> => {
@@ -67,9 +73,10 @@ export const useKnowledgeStore = defineStore('knowledge', () => {
   const fetchMilvusChunks = async (
     kbId: number,
     offset = 0,
-    limit = 50
+    limit = 50,
+    cursor: number | null = null
   ): Promise<MilvusChunkPage> => {
-    const res = await getMilvusChunks(kbId, offset, limit)
+    const res = await getMilvusChunks(kbId, offset, limit, cursor)
     return res.data
   }
 
@@ -81,6 +88,7 @@ export const useKnowledgeStore = defineStore('knowledge', () => {
     createKnowledgeBase: createKnowledgeBaseAction,
     deleteKnowledgeBase: deleteKnowledgeBaseAction,
     uploadDocument: uploadDocumentAction,
+    fetchDocumentTask,
     fetchMilvusSchema,
     fetchMilvusChunks
   }

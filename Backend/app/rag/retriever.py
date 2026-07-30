@@ -10,6 +10,7 @@ import tiktoken
 from pymilvus import Collection
 
 from app.knowledge_runtime import connect_milvus, embed_texts
+from app.rag.reranker import rerank_candidates
 
 
 RetrievalMode = Literal["semantic", "dense", "hybrid"]
@@ -154,6 +155,35 @@ def _lexical_candidates(
     return ranked
 
 
+def _sparse_candidates(
+    collection_name: str,
+    query_text: str,
+    candidate_limit: int,
+) -> list[dict[str, Any]] | None:
+    """Use Milvus BM25 for new collections; return None for legacy schemas."""
+    connect_milvus()
+    collection = Collection(collection_name)
+    if "sparse" not in {field.name for field in collection.schema.fields}:
+        return None
+    collection.load()
+    result = collection.search(
+        data=[query_text],
+        anns_field="sparse",
+        param={"metric_type": "BM25", "params": {}},
+        limit=candidate_limit,
+        output_fields=OUTPUT_FIELDS,
+    )
+    if not result:
+        return []
+    items: list[dict[str, Any]] = []
+    for hit in result[0]:
+        item = {field: hit.entity.get(field) for field in OUTPUT_FIELDS}
+        item["score"] = float(hit.distance)
+        item["embedding"] = None
+        items.append(item)
+    return items
+
+
 def _hybrid_rank(
     dense: list[dict[str, Any]],
     lexical: list[dict[str, Any]],
@@ -225,15 +255,20 @@ async def retrieve_context(
     )
 
     if mode == "dense":
-        ranked = dense[:result_limit]
+        ranked = dense
     elif mode == "semantic":
-        ranked = _mmr_rank(dense, query_vector, result_limit)
+        ranked = _mmr_rank(dense, query_vector, min(candidate_limit, result_limit * 3))
     else:
         lexical = await asyncio.to_thread(
-            _lexical_candidates, collection_name, query_text
+            _sparse_candidates, collection_name, query_text, candidate_limit
         )
-        ranked = _hybrid_rank(dense, lexical, result_limit)
+        if lexical is None:
+            lexical = await asyncio.to_thread(
+                _lexical_candidates, collection_name, query_text
+            )
+        ranked = _hybrid_rank(dense, lexical, candidate_limit)
 
+    ranked = await rerank_candidates(query_text, ranked, result_limit)
     selected, used_tokens = _apply_token_budget(ranked, max_tokens)
     return {
         "mode": mode,

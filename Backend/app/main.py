@@ -1,21 +1,20 @@
-"""Database-free backend matching the current frontend API contract."""
+"""FastAPI runtime backed by MySQL, Redis, Milvus, and OpenAI-compatible APIs."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
-import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
-from itertools import count
 from pathlib import Path
 from typing import Annotated, Literal
 
 import httpx
+from redis.exceptions import RedisError
+from sqlalchemy.exc import IntegrityError
+from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -27,50 +26,66 @@ from app.knowledge_runtime import (
     KnowledgeProcessingError,
     collection_details,
     create_collection,
-    delete_chunks,
     drop_collection,
-    embed_texts,
     embedding_config,
-    extract_document,
-    insert_chunks,
     list_chunks,
-    split_text_by_tokens,
 )
 from app.knowledge_repository import (
-    add_document_record,
     close_knowledge_database,
     create_knowledge_base_record,
     delete_knowledge_base_record,
     get_knowledge_base,
-    init_knowledge_tables,
     list_documents,
     list_knowledge_bases,
     serialize_document,
     serialize_knowledge_base,
 )
+from app.core.config import settings
+from app.core.security import (
+    create_access_token,
+    create_refresh_token,
+    hash_password,
+    token_fingerprint,
+    verify_password,
+    verify_token,
+)
+from app.db.redis import close_redis, redis_client
+from app.document_tasks import (
+    create_task as create_document_task,
+    document_worker,
+    enqueue_task,
+    get_task as get_document_task_record,
+    save_upload,
+    serialize_task,
+)
 from app.rag.retriever import format_rag_prompt, retrieve_context
+from app.state_repository import (
+    add_message,
+    create_conversation_record,
+    create_user,
+    delete_owned_conversation,
+    get_owned_conversation,
+    get_user,
+    get_user_by_username,
+    init_state_tables,
+    list_conversations,
+    list_messages,
+    list_users,
+    quota_state,
+    record_token_usage,
+    reset_user_usage,
+    serialize_conversation,
+    serialize_message,
+    serialize_user,
+    update_owned_conversation,
+    update_user_fields,
+)
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def initial_token_usage() -> dict:
-    timestamp = now_iso()
-    return {
-        "five_hour_token_limit": None,
-        "weekly_token_limit": None,
-        "five_hour_tokens_used": 0,
-        "weekly_tokens_used": 0,
-        "input_tokens_used": 0,
-        "output_tokens_used": 0,
-        "total_tokens_used": 0,
-        "five_hour_window_started_at": timestamp,
-        "weekly_window_started_at": timestamp,
-    }
-
+class TransientUpstreamError(RuntimeError):
+    pass
 
 class User(BaseModel):
     id: int
@@ -112,6 +127,10 @@ class TokenUsageReset(BaseModel):
     scope: Literal["five_hour", "weekly", "all"]
 
 
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(min_length=20)
+
+
 class ConversationCreate(BaseModel):
     title: str = "新对话"
     model_name: str | None = None
@@ -148,10 +167,19 @@ class KnowledgeBaseCreate(BaseModel):
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await init_knowledge_tables()
+    await init_state_tables()
+    worker_stop = asyncio.Event()
+    worker = asyncio.create_task(document_worker(worker_stop))
     try:
         yield
     finally:
+        worker_stop.set()
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+        await close_redis()
         await close_knowledge_database()
 
 
@@ -168,28 +196,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Development-only state. It intentionally resets when the process restarts.
-users: dict[int, dict] = {
-    1: {
-        "id": 1,
-        "username": "admin",
-        "email": "admin@example.com",
-        "password": "admin123",
-        "role": "admin",
-        "is_root_admin": True,
-        "is_active": True,
-        "created_at": now_iso(),
-        **initial_token_usage(),
-    }
-}
-tokens: dict[str, int] = {}
-login_attempts: dict[str, dict[str, float | int]] = {}
-conversations: dict[int, dict] = {}
-messages: dict[int, list[dict]] = {}
 model_discovery_cache: dict[str, object] = {"expires_at": 0.0, "models": []}
-user_ids = count(2)
-conversation_ids = count(1)
-message_ids = count(1)
 
 
 def configured_model_ids() -> list[str]:
@@ -282,10 +289,25 @@ async def discover_models(refresh: bool = False) -> list[dict]:
         if not api_key or not api_base:
             raise RuntimeError("模型服务 URL 或 API Key 未配置")
         async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(
-                f"{api_base}/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
+            response: httpx.Response | None = None
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
+                retry=retry_if_exception_type(
+                    (httpx.TransportError, TransientUpstreamError)
+                ),
+                reraise=True,
+            ):
+                with attempt:
+                    response = await client.get(
+                        f"{api_base}/models",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                    )
+                    if response.status_code == 429 or response.status_code >= 500:
+                        raise TransientUpstreamError(
+                            f"模型发现服务暂时不可用: {response.status_code}"
+                        )
+            assert response is not None
             response.raise_for_status()
             payload = response.json()
 
@@ -309,101 +331,28 @@ async def discover_models(refresh: bool = False) -> list[dict]:
     return models
 
 
-def refresh_token_windows(user: dict) -> None:
-    defaults = initial_token_usage()
-    for key, value in defaults.items():
-        user.setdefault(key, value)
-
-    now = datetime.now(timezone.utc)
-    five_hour_start = datetime.fromisoformat(user["five_hour_window_started_at"])
-    weekly_start = datetime.fromisoformat(user["weekly_window_started_at"])
-    if now >= five_hour_start + timedelta(hours=5):
-        user["five_hour_tokens_used"] = 0
-        user["five_hour_window_started_at"] = now.isoformat()
-    if now >= weekly_start + timedelta(days=7):
-        user["weekly_tokens_used"] = 0
-        user["weekly_window_started_at"] = now.isoformat()
-
-
-def public_user(user: dict) -> User:
-    refresh_token_windows(user)
-    payload = {key: value for key, value in user.items() if key != "password"}
-    five_hour_start = datetime.fromisoformat(user["five_hour_window_started_at"])
-    weekly_start = datetime.fromisoformat(user["weekly_window_started_at"])
-    payload["five_hour_resets_at"] = (five_hour_start + timedelta(hours=5)).isoformat()
-    payload["weekly_resets_at"] = (weekly_start + timedelta(days=7)).isoformat()
-    return User(**payload)
-
-
-def enforce_token_quota(user: dict) -> None:
-    refresh_token_windows(user)
-    checks = [
-        (
-            "5 小时",
-            user["five_hour_token_limit"],
-            user["five_hour_tokens_used"],
-            datetime.fromisoformat(user["five_hour_window_started_at"]) + timedelta(hours=5),
-        ),
-        (
-            "周",
-            user["weekly_token_limit"],
-            user["weekly_tokens_used"],
-            datetime.fromisoformat(user["weekly_window_started_at"]) + timedelta(days=7),
-        ),
-    ]
-    now = datetime.now(timezone.utc)
-    for label, limit, used, resets_at in checks:
-        if limit is not None and used >= limit:
-            retry_after = max(1, math.ceil((resets_at - now).total_seconds()))
-            raise HTTPException(
-                status_code=429,
-                detail=f"已达到{label} Token 上限，请等待重置或联系管理员",
-                headers={"Retry-After": str(retry_after)},
-            )
-
-
-def record_token_usage(user: dict, usage: dict) -> None:
-    refresh_token_windows(user)
-    input_tokens = max(0, int(usage.get("prompt_tokens") or 0))
-    output_tokens = max(0, int(usage.get("completion_tokens") or 0))
-    total_tokens = max(0, int(usage.get("total_tokens") or input_tokens + output_tokens))
-    user["input_tokens_used"] += input_tokens
-    user["output_tokens_used"] += output_tokens
-    user["total_tokens_used"] += total_tokens
-    user["five_hour_tokens_used"] += total_tokens
-    user["weekly_tokens_used"] += total_tokens
-
-
 def bearer_token(authorization: Annotated[str | None, Header()] = None) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="未登录")
     return authorization.removeprefix("Bearer ").strip()
 
 
-def current_user(token: Annotated[str, Depends(bearer_token)]) -> dict:
-    user_id = tokens.get(token)
-    user = users.get(user_id) if user_id else None
-    if not user or not user["is_active"]:
+async def current_user(token: Annotated[str, Depends(bearer_token)]):
+    try:
+        payload = verify_token(token, "access")
+        user_id = int(payload["sub"])
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="登录已失效")
+    user = await get_user(user_id)
+    if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="登录已失效")
     return user
 
 
-def admin_user(user: Annotated[dict, Depends(current_user)]) -> dict:
-    if user["role"] != "admin":
+def admin_user(user=Depends(current_user)):
+    if user.role != "admin":
         raise HTTPException(status_code=403, detail="需要管理员权限")
     return user
-
-
-def owned_conversation(conversation_id: int, user: dict) -> dict:
-    conversation = conversations.get(conversation_id)
-    if not conversation or conversation["user_id"] != user["id"]:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    return conversation
-
-
-def public_message(message: dict) -> dict:
-    """Keep ownership metadata server-side while returning the frontend shape."""
-    return {key: value for key, value in message.items() if key != "user_id"}
 
 
 @app.get("/")
@@ -420,7 +369,8 @@ async def health():
     return {
         "status": "ok",
         "storage": {
-            "users_and_chats": "memory",
+            "users_and_chats": "mysql",
+            "login_security": "redis",
             "knowledge_metadata": "mysql",
             "vectors": "milvus",
         },
@@ -429,180 +379,215 @@ async def health():
 
 @app.post("/auth/token")
 async def login(username: Annotated[str, Form()], password: Annotated[str, Form()]):
-    now = time.time()
-    attempt = login_attempts.get(username)
-    if attempt:
-        locked_until = float(attempt.get("locked_until", 0))
-        if locked_until > now:
-            retry_after = max(1, math.ceil(locked_until - now))
-            raise HTTPException(
-                status_code=429,
-                detail="密码错误次数过多，请 5 分钟后再试",
-                headers={"Retry-After": str(retry_after)},
-            )
-        if locked_until:
-            login_attempts.pop(username, None)
+    normalized_username = username.strip()
+    failure_key = f"auth:failures:{normalized_username}"
+    lock_key = f"auth:lock:{normalized_username}"
+    try:
+        retry_after = await redis_client.ttl(lock_key)
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="登录安全服务暂不可用") from exc
+    if retry_after > 0:
+        raise HTTPException(
+            status_code=429,
+            detail="密码错误次数过多，请 5 分钟后再试",
+            headers={"Retry-After": str(retry_after)},
+        )
 
-    user = next((item for item in users.values() if item["username"] == username), None)
-    if not user or user["password"] != password:
-        attempt = login_attempts.setdefault(username, {"failures": 0, "locked_until": 0})
-        attempt["failures"] = int(attempt["failures"]) + 1
-        if int(attempt["failures"]) >= 3:
-            attempt["locked_until"] = now + 300
-            raise HTTPException(
-                status_code=429,
-                detail="密码错误次数过多，请 5 分钟后再试",
-                headers={"Retry-After": "300"},
-            )
+    user = await get_user_by_username(normalized_username)
+    if not user or not verify_password(password, user.hashed_password):
+        try:
+            failures = await redis_client.incr(failure_key)
+            if failures == 1:
+                await redis_client.expire(failure_key, 300)
+            if failures >= 3:
+                pipeline = redis_client.pipeline(transaction=True)
+                pipeline.set(lock_key, "1", ex=300)
+                pipeline.delete(failure_key)
+                await pipeline.execute()
+                raise HTTPException(
+                    status_code=429,
+                    detail="密码错误次数过多，请 5 分钟后再试",
+                    headers={"Retry-After": "300"},
+                )
+        except RedisError as exc:
+            raise HTTPException(status_code=503, detail="登录安全服务暂不可用") from exc
         raise HTTPException(status_code=401, detail="密码错误")
 
-    if not user["is_active"]:
+    if not user.is_active:
         raise HTTPException(status_code=403, detail="账户已停用")
 
-    login_attempts.pop(username, None)
-    token = secrets.token_urlsafe(32)
-    tokens[token] = user["id"]
-    return {"access_token": token, "token_type": "bearer", "user": public_user(user)}
+    access_token = create_access_token(user.id, user.username)
+    refresh_token, refresh_id = create_refresh_token(user.id, user.username)
+    try:
+        pipeline = redis_client.pipeline(transaction=True)
+        pipeline.delete(failure_key, lock_key)
+        pipeline.set(
+            f"auth:refresh:{refresh_id}",
+            token_fingerprint(refresh_token),
+            ex=settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+        )
+        await pipeline.execute()
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="登录安全服务暂不可用") from exc
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "user": serialize_user(user),
+    }
+
+
+@app.post("/auth/refresh")
+async def refresh_access_token(data: RefreshTokenRequest):
+    try:
+        payload = verify_token(data.refresh_token, "refresh")
+        refresh_id = str(payload["jti"])
+        user_id = int(payload["sub"])
+        expected = await redis_client.get(f"auth:refresh:{refresh_id}")
+    except (ValueError, TypeError, RedisError) as exc:
+        raise HTTPException(status_code=401, detail="Refresh Token 无效或已过期") from exc
+    if not expected or expected != token_fingerprint(data.refresh_token):
+        raise HTTPException(status_code=401, detail="Refresh Token 无效或已过期")
+    user = await get_user(user_id)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="账户不存在或已停用")
+    return {
+        "access_token": create_access_token(user.id, user.username),
+        "token_type": "bearer",
+        "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    }
+
+
+@app.post("/auth/logout")
+async def logout(data: RefreshTokenRequest):
+    try:
+        payload = verify_token(data.refresh_token, "refresh")
+        await redis_client.delete(f"auth:refresh:{payload['jti']}")
+    except (ValueError, RedisError):
+        pass
+    return {"status": "success"}
 
 
 @app.post("/auth/register", response_model=User)
 async def register(data: RegisterRequest):
-    if any(user["username"] == data.username for user in users.values()):
-        raise HTTPException(status_code=409, detail="用户名已存在")
-    if any(user["email"] == data.email for user in users.values()):
-        raise HTTPException(status_code=409, detail="邮箱已存在")
-    user_id = next(user_ids)
-    user = {
-        "id": user_id,
-        "username": data.username,
-        "email": data.email,
-        "password": data.password,
-        "role": "employee",
-        "is_root_admin": False,
-        "is_active": True,
-        "created_at": now_iso(),
-        **initial_token_usage(),
-    }
-    users[user_id] = user
-    return public_user(user)
+    try:
+        user = await create_user(
+            username=data.username.strip(),
+            email=data.email.strip().lower(),
+            hashed_password=hash_password(data.password),
+        )
+    except IntegrityError as exc:
+        message = str(exc.orig).lower()
+        detail = "邮箱已存在" if "email" in message else "用户名已存在"
+        raise HTTPException(status_code=409, detail=detail) from exc
+    return serialize_user(user)
 
 
 @app.get("/auth/me", response_model=User)
-async def get_me(user: Annotated[dict, Depends(current_user)]):
-    return public_user(user)
+async def get_me(user=Depends(current_user)):
+    return serialize_user(user)
 
 
 @app.get("/auth/users", response_model=list[User])
-async def get_users(_: Annotated[dict, Depends(admin_user)]):
-    return [public_user(user) for user in users.values()]
+async def get_users(_: Annotated[object, Depends(admin_user)]):
+    return [serialize_user(user) for user in await list_users()]
 
 
 @app.put("/auth/users/{user_id}", response_model=User)
 async def update_user(
     user_id: int,
     data: UserUpdate,
-    operator: Annotated[dict, Depends(admin_user)],
+    operator=Depends(admin_user),
 ):
-    user = users.get(user_id)
+    user = await get_user(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
 
     changed_fields = data.model_fields_set
-    if user["is_root_admin"] and not operator["is_root_admin"] and changed_fields:
+    if "role" in changed_fields and data.role is None:
+        raise HTTPException(status_code=422, detail="用户身份不能为 null")
+    if "is_active" in changed_fields and data.is_active is None:
+        raise HTTPException(status_code=422, detail="账户状态不能为 null")
+    if user.is_root_admin and not operator.is_root_admin and changed_fields:
         raise HTTPException(status_code=403, detail="系统管理员账户不可修改")
     if "role" in changed_fields:
-        if not operator["is_root_admin"]:
+        if not operator.is_root_admin:
             raise HTTPException(status_code=403, detail="只有系统管理员可以修改用户身份")
-        if user["is_root_admin"] and data.role != "admin":
+        if user.is_root_admin and data.role != "admin":
             raise HTTPException(status_code=403, detail="系统管理员身份不可更改")
-    if user["is_root_admin"] and "is_active" in changed_fields and data.is_active is not True:
+    if user.is_root_admin and "is_active" in changed_fields and data.is_active is not True:
         raise HTTPException(status_code=403, detail="系统管理员账户不可停用")
 
-    for key in data.model_fields_set:
-        user[key] = getattr(data, key)
-    return public_user(user)
+    updated = await update_user_fields(
+        user_id, {key: getattr(data, key) for key in changed_fields}
+    )
+    return serialize_user(updated)
 
 
 @app.post("/auth/users/{user_id}/token-usage/reset", response_model=User)
 async def reset_user_token_usage(
     user_id: int,
     data: TokenUsageReset,
-    _: Annotated[dict, Depends(admin_user)],
+    _: Annotated[object, Depends(admin_user)],
 ):
-    user = users.get(user_id)
+    user = await reset_user_usage(user_id, data.scope)
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
-    timestamp = now_iso()
-    if data.scope in {"five_hour", "all"}:
-        user["five_hour_tokens_used"] = 0
-        user["five_hour_window_started_at"] = timestamp
-    if data.scope in {"weekly", "all"}:
-        user["weekly_tokens_used"] = 0
-        user["weekly_window_started_at"] = timestamp
-    return public_user(user)
+    return serialize_user(user)
 
 
 @app.get("/chat/conversations")
-async def get_conversations(user: Annotated[dict, Depends(current_user)]):
-    result = [
-        {key: value for key, value in conversation.items() if key != "user_id"}
-        for conversation in conversations.values()
-        if conversation["user_id"] == user["id"]
+async def get_conversations(user=Depends(current_user)):
+    return [
+        serialize_conversation(item) for item in await list_conversations(user.id)
     ]
-    return sorted(result, key=lambda item: item["updated_at"], reverse=True)
 
 
 @app.post("/chat/conversations")
-async def create_conversation(data: ConversationCreate, user: Annotated[dict, Depends(current_user)]):
+async def create_conversation(data: ConversationCreate, user=Depends(current_user)):
     if data.rag_enabled:
         if data.knowledge_base_id is None:
             raise HTTPException(status_code=422, detail="启用 RAG 前请选择知识库")
         if not await get_knowledge_base(data.knowledge_base_id):
             raise HTTPException(status_code=404, detail="知识库不存在")
-    conversation_id = next(conversation_ids)
-    timestamp = now_iso()
-    conversation = {
-        "id": conversation_id,
-        "user_id": user["id"],
-        "title": data.title,
-        "model_name": data.model_name or default_model_id(),
-        "knowledge_base_id": data.knowledge_base_id,
-        "rag_enabled": data.rag_enabled,
-        "retrieval_mode": data.retrieval_mode,
-        "max_retrieval_tokens": data.max_retrieval_tokens,
-        "created_at": timestamp,
-        "updated_at": timestamp,
-    }
-    conversations[conversation_id] = conversation
-    messages[conversation_id] = []
-    return {key: value for key, value in conversation.items() if key != "user_id"}
+    conversation = await create_conversation_record(
+        user_id=user.id,
+        title=data.title,
+        model_name=data.model_name or default_model_id(),
+        knowledge_base_id=data.knowledge_base_id,
+        rag_enabled=data.rag_enabled,
+        retrieval_mode=data.retrieval_mode,
+        max_retrieval_tokens=data.max_retrieval_tokens,
+    )
+    return serialize_conversation(conversation)
 
 
 @app.delete("/chat/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: int, user: Annotated[dict, Depends(current_user)]):
-    owned_conversation(conversation_id, user)
-    del conversations[conversation_id]
-    messages.pop(conversation_id, None)
+async def delete_conversation(conversation_id: int, user=Depends(current_user)):
+    if not await delete_owned_conversation(conversation_id, user.id):
+        raise HTTPException(status_code=404, detail="会话不存在")
     return {"status": "success"}
 
 
 @app.get("/chat/conversations/{conversation_id}/messages")
-async def get_messages(conversation_id: int, user: Annotated[dict, Depends(current_user)]):
-    owned_conversation(conversation_id, user)
+async def get_messages(conversation_id: int, user=Depends(current_user)):
+    if not await get_owned_conversation(conversation_id, user.id):
+        raise HTTPException(status_code=404, detail="会话不存在")
     return [
-        public_message(message)
-        for message in messages.get(conversation_id, [])
-        if message["user_id"] == user["id"]
+        serialize_message(message) for message in await list_messages(conversation_id)
     ]
 
 
 @app.put("/chat/conversations/{conversation_id}/model")
 async def update_conversation_model(
-    conversation_id: int, data: ModelUpdate, user: Annotated[dict, Depends(current_user)]
+    conversation_id: int, data: ModelUpdate, user=Depends(current_user)
 ):
-    conversation = owned_conversation(conversation_id, user)
-    conversation["model_name"] = data.model_name
-    conversation["updated_at"] = now_iso()
+    conversation = await update_owned_conversation(
+        conversation_id, user.id, {"model_name": data.model_name}
+    )
+    if not conversation:
+        raise HTTPException(status_code=404, detail="会话不存在")
     return {"status": "success", "model_name": data.model_name}
 
 
@@ -610,19 +595,26 @@ async def update_conversation_model(
 async def update_conversation_rag(
     conversation_id: int,
     data: RagSettingsUpdate,
-    user: Annotated[dict, Depends(current_user)],
+    user=Depends(current_user),
 ):
-    conversation = owned_conversation(conversation_id, user)
+    conversation = await get_owned_conversation(conversation_id, user.id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="会话不存在")
     if data.rag_enabled:
         if data.knowledge_base_id is None:
             raise HTTPException(status_code=422, detail="启用 RAG 前请选择知识库")
         if not await get_knowledge_base(data.knowledge_base_id):
             raise HTTPException(status_code=404, detail="知识库不存在")
-    conversation["rag_enabled"] = data.rag_enabled
-    conversation["knowledge_base_id"] = data.knowledge_base_id
-    conversation["retrieval_mode"] = data.retrieval_mode
-    conversation["max_retrieval_tokens"] = data.max_retrieval_tokens
-    conversation["updated_at"] = now_iso()
+    await update_owned_conversation(
+        conversation_id,
+        user.id,
+        {
+            "rag_enabled": data.rag_enabled,
+            "knowledge_base_id": data.knowledge_base_id,
+            "retrieval_mode": data.retrieval_mode,
+            "max_retrieval_tokens": data.max_retrieval_tokens,
+        },
+    )
     return {
         "status": "success",
         "rag_enabled": data.rag_enabled,
@@ -634,15 +626,29 @@ async def update_conversation_rag(
 
 @app.post("/chat/conversations/{conversation_id}/messages/stream")
 async def stream_message(
-    conversation_id: int, data: ChatRequest, user: Annotated[dict, Depends(current_user)]
+    conversation_id: int, data: ChatRequest, user=Depends(current_user)
 ):
-    conversation = owned_conversation(conversation_id, user)
-    enforce_token_quota(user)
+    conversation = await get_owned_conversation(conversation_id, user.id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    _, retry_after = await quota_state(user.id)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="已达到 Token 上限，请等待重置或联系管理员",
+            headers={"Retry-After": str(retry_after)},
+        )
 
-    conversation["rag_enabled"] = data.rag_enabled
-    conversation["knowledge_base_id"] = data.knowledge_base_id
-    conversation["retrieval_mode"] = data.retrieval_mode
-    conversation["max_retrieval_tokens"] = data.max_retrieval_tokens
+    conversation = await update_owned_conversation(
+        conversation_id,
+        user.id,
+        {
+            "rag_enabled": data.rag_enabled,
+            "knowledge_base_id": data.knowledge_base_id,
+            "retrieval_mode": data.retrieval_mode,
+            "max_retrieval_tokens": data.max_retrieval_tokens,
+        },
+    )
     retrieval: dict | None = None
     if data.rag_enabled:
         if data.knowledge_base_id is None:
@@ -663,25 +669,21 @@ async def stream_message(
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"RAG 检索失败: {exc}") from exc
 
-    messages[conversation_id].append(
-        {
-            "id": next(message_ids),
-            "user_id": user["id"],
-            "conversation_id": conversation_id,
-            "role": "user",
-            "content": data.content,
-            "created_at": now_iso(),
-        }
+    history = await list_messages(conversation_id)
+    await add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content=data.content,
     )
-    conversation["updated_at"] = now_iso()
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip() or os.getenv("DASHSCOPE_API_KEY", "").strip()
     api_base = os.getenv("OPENAI_API_BASE", "").strip().rstrip("/")
     upstream_messages = [
-        {"role": item["role"], "content": item["content"]}
-        for item in messages[conversation_id][-20:]
-        if item["user_id"] == user["id"] and item["role"] in {"user", "assistant", "system"}
+        {"role": item.role, "content": item.content}
+        for item in history[-19:]
+        if item.role in {"user", "assistant", "system"}
     ]
+    upstream_messages.append({"role": "user", "content": data.content})
     if retrieval is not None:
         upstream_messages.insert(
             0,
@@ -709,7 +711,7 @@ async def stream_message(
 
             timeout = httpx.Timeout(connect=15.0, read=300.0, write=30.0, pool=15.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream(
+                request = client.build_request(
                     "POST",
                     f"{api_base}/chat/completions",
                     headers={
@@ -718,12 +720,31 @@ async def stream_message(
                         "Accept": "text/event-stream",
                     },
                     json={
-                        "model": conversation["model_name"],
+                        "model": conversation.model_name,
                         "messages": upstream_messages,
                         "stream": True,
                         "stream_options": {"include_usage": True},
                     },
-                ) as response:
+                )
+                response: httpx.Response | None = None
+                async for attempt in AsyncRetrying(
+                    stop=stop_after_attempt(3),
+                    wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
+                    retry=retry_if_exception_type(
+                        (httpx.TransportError, TransientUpstreamError)
+                    ),
+                    reraise=True,
+                ):
+                    with attempt:
+                        response = await client.send(request, stream=True)
+                        if response.status_code == 429 or response.status_code >= 500:
+                            await response.aread()
+                            await response.aclose()
+                            raise TransientUpstreamError(
+                                f"模型服务暂时不可用: {response.status_code}"
+                            )
+                assert response is not None
+                try:
                     if response.status_code >= 400:
                         await response.aread()
                         try:
@@ -754,29 +775,26 @@ async def stream_message(
                             continue
                         content_parts.append(content)
                         yield f"data: {json.dumps({'content': content}, ensure_ascii=False)}\n\n"
+                finally:
+                    await response.aclose()
 
             full_content = "".join(content_parts)
             if full_content:
                 if token_usage:
-                    record_token_usage(user, token_usage)
-                messages[conversation_id].append(
-                    {
-                        "id": next(message_ids),
-                        "user_id": user["id"],
-                        "conversation_id": conversation_id,
-                        "role": "assistant",
-                        "content": full_content,
-                        "created_at": now_iso(),
-                        "rag_context": (
-                            {
-                                "enabled": True,
-                                "knowledge_base_id": data.knowledge_base_id,
-                                **retrieval,
-                            }
-                            if retrieval is not None
-                            else None
-                        ),
-                    }
+                    await record_token_usage(user.id, token_usage)
+                await add_message(
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=full_content,
+                    rag_context=(
+                        {
+                            "enabled": True,
+                            "knowledge_base_id": data.knowledge_base_id,
+                            **retrieval,
+                        }
+                        if retrieval is not None
+                        else None
+                    ),
                 )
             else:
                 raise RuntimeError("模型流已结束，但没有返回可显示的文本")
@@ -824,7 +842,7 @@ async def create_knowledge_base(
             collection_name=collection_name,
             embedding_model=config["model"],
             vector_dimension=data.vector_dimension,
-            created_by=user["id"],
+            created_by=user.id,
         )
     except Exception as exc:
         try:
@@ -850,13 +868,13 @@ async def delete_knowledge_base(
     return {"status": "success"}
 
 
-@app.post("/knowledge-bases/{knowledge_base_id}/documents/")
+@app.post("/knowledge-bases/{knowledge_base_id}/documents/", status_code=202)
 async def upload_document(
     knowledge_base_id: int,
-    user: Annotated[dict, Depends(admin_user)],
     file: Annotated[UploadFile, File()],
     chunk_tokens: Annotated[int, Form(ge=64, le=8192)] = 512,
     overlap_tokens: Annotated[int, Form(ge=0, le=4096)] = 64,
+    user=Depends(admin_user),
 ):
     knowledge_base = await get_knowledge_base(knowledge_base_id)
     if not knowledge_base:
@@ -864,56 +882,40 @@ async def upload_document(
     if overlap_tokens >= chunk_tokens:
         raise HTTPException(status_code=422, detail="Overlap 必须小于切片 Token 数")
 
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="上传文件为空")
-    if len(content) > 30 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="文件不能超过 30 MB")
-
     file_name = file.filename or "未命名文件"
-    primary_keys: list[int] = []
+    task_id = str(uuid.uuid4())
     try:
-        text, source_type = await asyncio.to_thread(extract_document, file_name, content)
-        chunks = await asyncio.to_thread(split_text_by_tokens, text, chunk_tokens, overlap_tokens)
-        vectors = await embed_texts(
-            [chunk["text"] for chunk in chunks], knowledge_base.vector_dimension
+        temp_path, file_size = await save_upload(file, task_id)
+        task = await create_document_task(
+            task_id=task_id,
+            knowledge_base_id=knowledge_base_id,
+            created_by=user.id,
+            file_name=file_name,
+            content_type=file.content_type,
+            file_size=file_size,
+            temp_path=str(temp_path),
+            chunk_tokens=chunk_tokens,
+            overlap_tokens=overlap_tokens,
         )
-        primary_keys = await asyncio.to_thread(
-            insert_chunks,
-            knowledge_base.collection_name,
-            chunks,
-            vectors,
-            file_name,
-            source_type,
-            user["id"],
-        )
-        try:
-            document = await add_document_record(
-                knowledge_base_id=knowledge_base_id,
-                name=file_name,
-                size=len(content),
-                content_type=file.content_type,
-                source_type=source_type,
-                chunk_tokens=chunk_tokens,
-                overlap_tokens=overlap_tokens,
-                chunk_count=len(primary_keys),
-                total_tokens=sum(chunk["token_count"] for chunk in chunks),
-                vector_dimension=knowledge_base.vector_dimension,
-                embedding_model=knowledge_base.embedding_model,
-            )
-        except Exception:
-            await asyncio.to_thread(
-                delete_chunks, knowledge_base.collection_name, primary_keys
-            )
-            raise
-    except EmbeddingServiceError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except KnowledgeProcessingError as exc:
+        await enqueue_task(task.id)
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="文档任务队列暂不可用") from exc
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"文档向量化失败: {exc}") from exc
+        raise HTTPException(status_code=503, detail=f"创建文档任务失败: {exc}") from exc
 
-    return {"status": "success", "document": serialize_document(document)}
+    return {"status": "queued", "task": serialize_task(task)}
+
+
+@app.get("/knowledge-bases/tasks/{task_id}")
+async def get_document_task(task_id: str, user=Depends(current_user)):
+    task = await get_document_task_record(
+        task_id, user.id, is_admin=user.role == "admin"
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="文档任务不存在")
+    return serialize_task(task)
 
 
 @app.get("/knowledge-bases/{knowledge_base_id}/documents/")
@@ -947,13 +949,14 @@ async def get_milvus_chunks(
     _: Annotated[dict, Depends(current_user)],
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    cursor: Annotated[int | None, Query(ge=0)] = None,
 ):
     knowledge_base = await get_knowledge_base(knowledge_base_id)
     if not knowledge_base:
         raise HTTPException(status_code=404, detail="知识库不存在")
     try:
         return await asyncio.to_thread(
-            list_chunks, knowledge_base.collection_name, offset, limit
+            list_chunks, knowledge_base.collection_name, offset, limit, cursor
         )
     except KnowledgeProcessingError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

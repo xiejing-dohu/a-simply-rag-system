@@ -1,4 +1,4 @@
-import request, { API_BASE_URL } from './request'
+import request, { API_BASE_URL, refreshAccessToken } from './request'
 import type { Conversation, Message, RagContext, RetrievalMode } from '../types'
 
 export interface RagSettings {
@@ -47,18 +47,25 @@ export const sendMessage = async (
   onChunk: (chunk: string) => void,
   onRag: (context: RagContext) => void
 ) => {
-  const token = localStorage.getItem('token')
-  const response = await fetch(`${API_BASE_URL}/chat/conversations/${conversationId}/messages/stream`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`
-    },
-    body: JSON.stringify({ content, ...settings })
-  })
+  const execute = (token: string | null) =>
+    fetch(`${API_BASE_URL}/chat/conversations/${conversationId}/messages/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token || ''}`
+      },
+      body: JSON.stringify({ content, ...settings })
+    })
+
+  let response = await execute(localStorage.getItem('token'))
+  if (response.status === 401 && localStorage.getItem('refresh_token')) {
+    response = await execute(await refreshAccessToken())
+  }
 
   if (!response.ok) {
     if (response.status === 401) {
+      localStorage.removeItem('token')
+      localStorage.removeItem('refresh_token')
       window.location.href = '/login'
     }
     let detail = '网络请求失败'

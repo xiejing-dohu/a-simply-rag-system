@@ -66,7 +66,14 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="uploadVisible" title="上传文档并向量化" width="560px" @closed="resetUpload">
+    <el-dialog
+      v-model="uploadVisible"
+      title="上传文档并向量化"
+      width="560px"
+      :close-on-click-modal="!uploading"
+      :show-close="!uploading"
+      @closed="resetUpload"
+    >
       <el-alert
         :title="`${uploadTarget?.name || ''} · ${uploadTarget?.vector_dimension || ''} 维`"
         type="info"
@@ -106,11 +113,21 @@
         <div class="form-tip upload-tip">
           实际流程：提取/拼接全文 → token 切片 → {{ kbStore.embeddingConfig?.model }} → Milvus。
         </div>
+        <div v-if="uploadTask" class="task-progress">
+          <el-progress
+            :percentage="uploadTask.progress"
+            :status="uploadTask.status === 'failed' ? 'exception' : uploadTask.status === 'completed' ? 'success' : undefined"
+          />
+          <div class="task-stage">
+            {{ taskStageText }}
+            <span v-if="uploadTask.status === 'queued'">（任务已持久化，可安全等待）</span>
+          </div>
+        </div>
       </el-form>
       <template #footer>
-        <el-button @click="uploadVisible = false">取消</el-button>
+        <el-button :disabled="uploading" @click="uploadVisible = false">取消</el-button>
         <el-button type="primary" :loading="uploading" @click="handleUpload">
-          {{ uploading ? '处理中…' : '上传并处理' }}
+          {{ uploading ? taskStageText : '上传并处理' }}
         </el-button>
       </template>
     </el-dialog>
@@ -148,15 +165,13 @@
               </template>
             </el-table-column>
           </el-table>
-          <el-pagination
-            v-if="chunkPage && chunkPage.total > pageSize"
-            class="pagination"
-            layout="prev, pager, next, total"
-            :page-size="pageSize"
-            :total="chunkPage.total"
-            :current-page="currentPage"
-            @current-change="handlePageChange"
-          />
+          <div v-if="chunkPage && chunkPage.total > pageSize" class="cursor-pagination">
+            <span>第 {{ currentPage }} 页 · 共 {{ chunkPage.total }} 条</span>
+            <div>
+              <el-button :disabled="currentPage <= 1" @click="handlePreviousPage">上一页</el-button>
+              <el-button :disabled="chunkPage.next_cursor === null" @click="handleNextPage">下一页</el-button>
+            </div>
+          </div>
         </el-tab-pane>
       </el-tabs>
     </el-drawer>
@@ -170,7 +185,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { useKnowledgeStore } from '../stores/knowledge'
 import { useAuthStore } from '../stores/auth'
-import type { KnowledgeBase, MilvusChunkPage, MilvusSchema } from '../types'
+import type { DocumentTask, KnowledgeBase, MilvusChunkPage, MilvusSchema } from '../types'
 
 const kbStore = useKnowledgeStore()
 const authStore = useAuthStore()
@@ -181,6 +196,7 @@ const creating = ref(false)
 const uploading = ref(false)
 const dataLoading = ref(false)
 const selectedFile = ref<File | null>(null)
+const uploadTask = ref<DocumentTask | null>(null)
 const uploadTarget = ref<KnowledgeBase | null>(null)
 const dataTarget = ref<KnowledgeBase | null>(null)
 const schema = ref<MilvusSchema | null>(null)
@@ -188,16 +204,30 @@ const chunkPage = ref<MilvusChunkPage | null>(null)
 const activeDataTab = ref('schema')
 const currentPage = ref(1)
 const pageSize = 20
+const cursorHistory = ref<(number | null)[]>([null])
 
 const form = reactive({ name: '', description: '', vectorDimension: 1024 })
 const uploadForm = reactive({ chunkTokens: 512, overlapTokens: 64 })
 const acceptedExtensions = computed(() =>
   (kbStore.embeddingConfig?.supported_extensions || []).join(',')
 )
+const stageNames: Record<string, string> = {
+  queued: '等待处理',
+  parsing: '正在解析文档',
+  splitting: '正在切分文本',
+  embedding: '正在生成向量',
+  milvus: '正在写入 Milvus',
+  metadata: '正在保存元信息',
+  completed: '处理完成',
+  failed: '处理失败'
+}
+const taskStageText = computed(() =>
+  stageNames[uploadTask.value?.stage || 'queued'] || '处理中'
+)
 
 const errorMessage = (error: unknown, fallback: string) => {
   const detail = (error as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-  return detail || fallback
+  return detail || (error instanceof Error ? error.message : fallback)
 }
 
 onMounted(async () => {
@@ -248,6 +278,7 @@ const handleFileChange = (uploadFile: UploadFile) => {
 
 const handleFileRemove = () => {
   selectedFile.value = null
+  uploadTask.value = null
 }
 
 const resetUpload = () => {
@@ -264,15 +295,26 @@ const handleUpload = async () => {
   }
   uploading.value = true
   try {
-    const result = await kbStore.uploadDocument(
+    uploadTask.value = await kbStore.uploadDocument(
       uploadTarget.value.id,
       selectedFile.value,
       uploadForm.chunkTokens,
       uploadForm.overlapTokens
     )
+    while (
+      uploadTask.value.status === 'queued' ||
+      uploadTask.value.status === 'processing'
+    ) {
+      await new Promise(resolve => window.setTimeout(resolve, 1000))
+      uploadTask.value = await kbStore.fetchDocumentTask(uploadTask.value.id)
+    }
+    if (uploadTask.value.status === 'failed') {
+      throw new Error(uploadTask.value.error || '文档处理失败')
+    }
     await kbStore.fetchKnowledgeBases()
+    ElMessage.success('文档解析、向量化和入库完成')
+    await new Promise(resolve => window.setTimeout(resolve, 500))
     uploadVisible.value = false
-    ElMessage.success(`处理完成：写入 ${result.chunk_count} 个切片`)
   } catch (error) {
     ElMessage.error(errorMessage(error, '上传或向量化失败'))
   } finally {
@@ -280,14 +322,13 @@ const handleUpload = async () => {
   }
 }
 
-const loadMilvusData = async (page = 1) => {
+const loadMilvusData = async (cursor: number | null = null, page = 1) => {
   if (!dataTarget.value) return
   dataLoading.value = true
   try {
-    const offset = (page - 1) * pageSize
     const [schemaResult, chunksResult] = await Promise.all([
       kbStore.fetchMilvusSchema(dataTarget.value.id),
-      kbStore.fetchMilvusChunks(dataTarget.value.id, offset, pageSize)
+      kbStore.fetchMilvusChunks(dataTarget.value.id, 0, pageSize, cursor)
     ])
     schema.value = schemaResult
     chunkPage.value = chunksResult
@@ -302,12 +343,24 @@ const loadMilvusData = async (page = 1) => {
 const openMilvusData = async (kb: KnowledgeBase) => {
   dataTarget.value = kb
   activeDataTab.value = 'schema'
+  cursorHistory.value = [null]
   dataVisible.value = true
-  await loadMilvusData(1)
+  await loadMilvusData(null, 1)
 }
 
-const handlePageChange = async (page: number) => {
-  await loadMilvusData(page)
+const handleNextPage = async () => {
+  if (chunkPage.value?.next_cursor === null || chunkPage.value?.next_cursor === undefined) return
+  cursorHistory.value.push(chunkPage.value.next_cursor)
+  await loadMilvusData(chunkPage.value.next_cursor, cursorHistory.value.length)
+}
+
+const handlePreviousPage = async () => {
+  if (cursorHistory.value.length <= 1) return
+  cursorHistory.value.pop()
+  await loadMilvusData(
+    cursorHistory.value[cursorHistory.value.length - 1],
+    cursorHistory.value.length
+  )
 }
 </script>
 
@@ -330,9 +383,11 @@ const handlePageChange = async (page: number) => {
 .upload-form { margin-top: 22px; }
 .upload-form :deep(.el-upload), .upload-form :deep(.el-upload-dragger) { width: 100%; }
 .upload-tip { margin-left: 120px; }
+.task-progress { margin: 22px 0 0 120px; }
+.task-stage { margin-top: 8px; color: var(--text-secondary); font-size: 12px; }
 .drawer-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
 .drawer-head h3 { margin: 0 0 6px; }
 .drawer-head span { color: var(--text-secondary); font-size: 12px; }
 .chunk-text { white-space: pre-wrap; max-height: 180px; overflow: auto; line-height: 1.55; font-size: 13px; }
-.pagination { margin-top: 20px; justify-content: flex-end; }
+.cursor-pagination { margin-top: 20px; display: flex; align-items: center; justify-content: space-between; color: var(--text-secondary); font-size: 13px; }
 </style>

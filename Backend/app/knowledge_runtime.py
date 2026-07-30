@@ -9,9 +9,18 @@ from typing import Any
 import httpx
 import pandas as pd
 import tiktoken
+from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 from docx import Document as DocxDocument
 from pypdf import PdfReader
-from pymilvus import Collection, CollectionSchema, DataType, FieldSchema, connections, utility
+from pymilvus import (
+    Collection,
+    DataType,
+    Function,
+    FunctionType,
+    MilvusClient,
+    connections,
+    utility,
+)
 
 
 SUPPORTED_EXTENSIONS = {".docx", ".xlsx", ".xls", ".csv", ".txt", ".md", ".pdf"}
@@ -23,6 +32,10 @@ class KnowledgeProcessingError(RuntimeError):
 
 
 class EmbeddingServiceError(KnowledgeProcessingError):
+    pass
+
+
+class TransientEmbeddingError(RuntimeError):
     pass
 
 
@@ -158,24 +171,65 @@ def create_collection(collection_name: str, vector_dimension: int) -> None:
     connect_milvus()
     if utility.has_collection(collection_name):
         return
-    schema = CollectionSchema(
-        fields=[
-            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
-            FieldSchema(name="document_name", dtype=DataType.VARCHAR, max_length=1024),
-            FieldSchema(name="source_type", dtype=DataType.VARCHAR, max_length=32),
-            FieldSchema(name="chunk_index", dtype=DataType.INT64),
-            FieldSchema(name="token_count", dtype=DataType.INT64),
-            FieldSchema(name="uploaded_by", dtype=DataType.INT64),
-            FieldSchema(name="created_at", dtype=DataType.VARCHAR, max_length=64),
-            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=vector_dimension),
-        ],
-        description=f"RAG 知识库，向量维度 {vector_dimension}",
+    uri = (
+        f"http://{os.getenv('MILVUS_HOST', 'localhost')}:"
+        f"{os.getenv('MILVUS_PORT', '19530')}"
     )
-    collection = Collection(collection_name, schema=schema)
-    collection.create_index(
+    client = MilvusClient(uri=uri)
+    schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
+    schema.add_field(
+        field_name="id", datatype=DataType.INT64, is_primary=True, auto_id=True
+    )
+    schema.add_field(
+        field_name="text",
+        datatype=DataType.VARCHAR,
+        max_length=65535,
+        enable_analyzer=True,
+        analyzer_params={"tokenizer": "standard", "filter": ["lowercase"]},
+    )
+    schema.add_field(field_name="sparse", datatype=DataType.SPARSE_FLOAT_VECTOR)
+    schema.add_field(
+        field_name="document_name", datatype=DataType.VARCHAR, max_length=1024
+    )
+    schema.add_field(
+        field_name="source_type", datatype=DataType.VARCHAR, max_length=32
+    )
+    schema.add_field(field_name="chunk_index", datatype=DataType.INT64)
+    schema.add_field(field_name="token_count", datatype=DataType.INT64)
+    schema.add_field(field_name="uploaded_by", datatype=DataType.INT64)
+    schema.add_field(
+        field_name="created_at", datatype=DataType.VARCHAR, max_length=64
+    )
+    schema.add_field(
         field_name="embedding",
-        index_params={"metric_type": "COSINE", "index_type": "IVF_FLAT", "params": {"nlist": 128}},
+        datatype=DataType.FLOAT_VECTOR,
+        dim=vector_dimension,
+    )
+    schema.add_function(
+        Function(
+            name="text_bm25",
+            input_field_names=["text"],
+            output_field_names=["sparse"],
+            function_type=FunctionType.BM25,
+        )
+    )
+    indexes = MilvusClient.prepare_index_params()
+    indexes.add_index(
+        field_name="embedding",
+        metric_type="COSINE",
+        index_type="IVF_FLAT",
+        params={"nlist": 128},
+    )
+    indexes.add_index(
+        field_name="sparse",
+        metric_type="BM25",
+        index_type="SPARSE_INVERTED_INDEX",
+        params={"inverted_index_algo": "DAAT_MAXSCORE"},
+    )
+    client.create_collection(
+        collection_name=collection_name,
+        schema=schema,
+        index_params=indexes,
     )
 
 
@@ -197,11 +251,37 @@ async def embed_texts(texts: list[str], vector_dimension: int) -> list[list[floa
     async with httpx.AsyncClient(timeout=timeout) as client:
         for start in range(0, len(texts), 10):
             batch = texts[start : start + 10]
-            response = await client.post(
-                f"{api_base}/embeddings",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model, "input": batch, "dimensions": vector_dimension, "encoding_format": "float"},
-            )
+            response: httpx.Response | None = None
+            try:
+                async for attempt in AsyncRetrying(
+                    stop=stop_after_attempt(3),
+                    wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
+                    retry=retry_if_exception_type(
+                        (httpx.TransportError, TransientEmbeddingError)
+                    ),
+                    reraise=True,
+                ):
+                    with attempt:
+                        response = await client.post(
+                            f"{api_base}/embeddings",
+                            headers={
+                                "Authorization": f"Bearer {api_key}",
+                                "Content-Type": "application/json",
+                            },
+                            json={
+                                "model": model,
+                                "input": batch,
+                                "dimensions": vector_dimension,
+                                "encoding_format": "float",
+                            },
+                        )
+                        if response.status_code == 429 or response.status_code >= 500:
+                            raise TransientEmbeddingError(
+                                f"向量服务暂时不可用: {response.status_code}"
+                            )
+            except (httpx.TransportError, TransientEmbeddingError) as exc:
+                raise EmbeddingServiceError(str(exc)) from exc
+            assert response is not None
             if response.status_code >= 400:
                 try:
                     payload = response.json()
@@ -238,14 +318,17 @@ def insert_chunks(
     timestamp = datetime.now(timezone.utc).isoformat()
     result = collection.insert(
         [
-            [chunk["text"] for chunk in chunks],
-            [document_name for _ in chunks],
-            [source_type for _ in chunks],
-            list(range(len(chunks))),
-            [chunk["token_count"] for chunk in chunks],
-            [uploaded_by for _ in chunks],
-            [timestamp for _ in chunks],
-            vectors,
+            {
+                "text": chunk["text"],
+                "document_name": document_name,
+                "source_type": source_type,
+                "chunk_index": index,
+                "token_count": chunk["token_count"],
+                "uploaded_by": uploaded_by,
+                "created_at": timestamp,
+                "embedding": vector,
+            }
+            for index, (chunk, vector) in enumerate(zip(chunks, vectors))
         ]
     )
     collection.flush()
@@ -295,7 +378,12 @@ def collection_details(collection_name: str) -> dict[str, Any]:
     }
 
 
-def list_chunks(collection_name: str, offset: int = 0, limit: int = 50) -> dict[str, Any]:
+def list_chunks(
+    collection_name: str,
+    offset: int = 0,
+    limit: int = 50,
+    cursor: int | None = None,
+) -> dict[str, Any]:
     connect_milvus()
     if not utility.has_collection(collection_name):
         raise KnowledgeProcessingError("Milvus 集合不存在")
@@ -303,7 +391,7 @@ def list_chunks(collection_name: str, offset: int = 0, limit: int = 50) -> dict[
     collection.load()
     total = _live_entity_count(collection)
     rows = collection.query(
-        expr="id >= 0",
+        expr=f"id > {int(cursor)}" if cursor is not None else "id >= 0",
         output_fields=[
             "id",
             "text",
@@ -314,8 +402,15 @@ def list_chunks(collection_name: str, offset: int = 0, limit: int = 50) -> dict[
             "uploaded_by",
             "created_at",
         ],
-        offset=max(0, offset),
+        offset=0 if cursor is not None else max(0, offset),
         limit=max(1, min(limit, 200)),
     )
     rows.sort(key=lambda row: row.get("id", 0))
-    return {"items": rows, "offset": offset, "limit": limit, "total": total}
+    next_cursor = int(rows[-1]["id"]) if len(rows) == limit else None
+    return {
+        "items": rows,
+        "offset": offset,
+        "limit": limit,
+        "total": total,
+        "next_cursor": next_cursor,
+    }

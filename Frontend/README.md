@@ -71,7 +71,7 @@ ChatView → chat Store → fetch/ReadableStream → SSE 事件 → 增量更新
 
 - API 根地址：`VITE_API_BASE_URL`，未设置时为 `http://localhost:8000`。
 - 除注册、登录、根路由、健康检查和模型发现外，业务接口均要求登录。
-- 登录成功后将 `access_token` 保存到 `localStorage.token`。
+- 登录成功后保存 Access JWT 和 Refresh Token；Access 过期时自动刷新并重试一次。
 - Axios 请求拦截器自动添加 `Authorization: Bearer <token>`。
 - 非登录请求收到 HTTP 401 时，前端删除本地 Token 并跳转 `/login`。
 - 普通接口响应为 JSON；参数校验错误采用 FastAPI 的 HTTP 422 格式。
@@ -128,7 +128,9 @@ ChatView → chat Store → fetch/ReadableStream → SSE 事件 → 增量更新
 ```json
 {
   "access_token": "server-generated-token",
+  "refresh_token": "server-generated-refresh-token",
   "token_type": "bearer",
+  "expires_in": 1800,
   "user": {
     "id": 1,
     "username": "admin",
@@ -175,6 +177,8 @@ ChatView → chat Store → fetch/ReadableStream → SSE 事件 → 增量更新
 | 方法 | 路径 | 权限 | 请求/响应 |
 | --- | --- | --- | --- |
 | GET | `/auth/me` | 登录用户 | 返回当前 `User` 及用量 |
+| POST | `/auth/refresh` | Refresh Token | 换取新的 Access JWT |
+| POST | `/auth/logout` | 无 | 吊销 Redis 中的 Refresh Token |
 | GET | `/auth/users` | 管理员 | 返回 `User[]` |
 | PUT | `/auth/users/{user_id}` | 管理员 | 更新状态、身份或限额，返回 `User` |
 | POST | `/auth/users/{user_id}/token-usage/reset` | 管理员 | 重置用量窗口，返回 `User` |
@@ -415,7 +419,8 @@ data: [DONE]
 
 `POST /knowledge-bases/{knowledge_base_id}/documents/`
 
-管理员使用 `multipart/form-data` 上传：
+管理员使用 `multipart/form-data` 上传。接口写完临时文件并创建任务后立即返回
+HTTP 202，前端随后轮询任务进度：
 
 | 字段 | 类型 | 范围 | 说明 |
 | --- | --- | --- | --- |
@@ -426,27 +431,30 @@ data: [DONE]
 支持 `.docx`、`.xlsx`、`.xls`、`.pdf`、`.txt`、`.md` 和 `.csv`。Excel 在后端
 先按工作表、列名和数据行拼接为完整文本，再统一切片。
 
-成功响应：
+排队响应：
 
 ```json
 {
-  "status": "success",
-  "document": {
-    "id": 1,
-    "name": "手册.xlsx",
-    "size": 10240,
-    "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "source_type": "xlsx",
+  "status": "queued",
+  "task": {
+    "id": "task-uuid",
+    "knowledge_base_id": 1,
+    "file_name": "手册.xlsx",
+    "file_size": 10240,
     "chunk_tokens": 512,
     "overlap_tokens": 64,
-    "chunk_count": 12,
-    "total_tokens": 5200,
-    "vector_dimension": 1024,
-    "embedding_model": "text-embedding-v4",
-    "created_at": "2026-07-30T00:00:00"
+    "status": "queued",
+    "stage": "queued",
+    "progress": 0,
+    "result_document_id": null,
+    "error": null
   }
 }
 ```
+
+`GET /knowledge-bases/tasks/{task_id}` 返回实时状态。阶段依次为 `queued`、
+`parsing`、`splitting`、`embedding`、`milvus`、`metadata`、`completed`；
+失败时为 `failed` 并包含 `error`。
 
 `GET /knowledge-bases/{knowledge_base_id}/documents/` 返回该知识库的
 `KnowledgeDocument[]`。
@@ -476,9 +484,10 @@ data: [DONE]
 }
 ```
 
-`GET /knowledge-bases/{knowledge_base_id}/milvus/chunks?offset=0&limit=50`
+`GET /knowledge-bases/{knowledge_base_id}/milvus/chunks?limit=50&cursor=123`
 
-- `offset`：大于等于 0；
+- `cursor`：上一页最后一条主键；首页不传；
+- `offset`：仅用于兼容旧客户端，新页面使用游标；
 - `limit`：1–200，默认 50。
 
 响应：
@@ -499,7 +508,8 @@ data: [DONE]
   ],
   "offset": 0,
   "limit": 50,
-  "total": 12
+  "total": 12,
+  "next_cursor": 456
 }
 ```
 
@@ -511,5 +521,5 @@ data: [DONE]
 - 管理页由路由守卫限制为管理员访问，最终权限仍以后端校验为准。
 - 顶部 Token 面板显示当前用户累计用量、5 小时/周窗口、管理员设置的具体上限或
   “无限”模式。
-- 当前用户、会话、消息和 Token 用量仍由后端内存保存，后端重启后会清空；知识库
-  元信息和向量数据不会随进程重启丢失。
+- 用户、会话、消息、Token 用量和任务状态均保存在 MySQL；刷新令牌和登录锁定
+  保存在 Redis，后端重启不会清空业务数据。

@@ -17,6 +17,10 @@ export const getMe = () => {
   return request.get<User>('/auth/me')
 }
 
+export const logout = (refreshToken: string) => {
+  return request.post('/auth/logout', { refresh_token: refreshToken })
+}
+
 export const getUsers = () => {
   return request.get<User[]>('/auth/users')
 }

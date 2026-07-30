@@ -11,7 +11,8 @@ Vue 前端
   │ REST / SSE
   ▼
 FastAPI（app/main.py）
-  ├─ 认证、角色、会话归属、Token 配额
+  ├─ JWT、角色、会话归属、Token 配额
+  ├─ Redis：Refresh Token、登录锁定、任务队列
   ├─ OpenAI-compatible /models 与 /chat/completions
   ├─ knowledge_repository.py ── SQLAlchemy async ── MySQL
   ├─ knowledge_runtime.py ───── 文档解析 / Embedding ── Milvus
@@ -20,21 +21,23 @@ FastAPI（app/main.py）
 Milvus ── etcd（内部元数据）+ MinIO（对象数据）
 ```
 
-当前是“混合持久化”的开发版本：
+当前存储边界：
 
 | 数据 | 存储位置 | 重启后 |
 | --- | --- | --- |
-| 用户、登录 Token、失败次数 | FastAPI 进程内存 | 清空并恢复默认管理员 |
-| 会话、消息、消息 RAG 上下文 | FastAPI 进程内存 | 清空 |
-| Token 累计和 5 小时/周窗口 | FastAPI 进程内存 | 清空 |
+| 用户、密码哈希、角色 | MySQL `users` | 保留 |
+| 会话、消息、消息 RAG 上下文 | MySQL `conversations/messages` | 保留 |
+| Token 累计和 5 小时/周窗口 | MySQL `users` | 保留 |
+| Refresh Token、失败锁定 | Redis | TTL 到期或主动吊销 |
+| 文档任务状态 | MySQL `document_tasks` | 保留并可恢复 |
+| 文档待处理队列 | Redis | AOF 持久化 |
 | 知识库、Collection 映射 | MySQL `knowledge_bases` | 保留 |
 | 文档处理元信息 | MySQL `knowledge_documents` | 保留 |
 | 切片文本、字段、向量 | Milvus | 保留 |
 | Milvus 内部元数据和对象 | etcd / MinIO | Docker Volume 保留 |
 
-这条边界很重要：当前不能把内存用户和 MySQL 中 `created_by`、Milvus 中
-`uploaded_by` 当作完整的生产级外键关系。生产化时应将用户、认证、会话、消息和
-配额一起迁移到 MySQL，并使用密码哈希和正式 JWT。
+Access Token 为短期 JWT，不在服务端保存；Refresh Token 指纹保存在 Redis，
+可独立吊销。MySQL 使用行锁更新 Token 窗口，避免并发请求覆盖统计。
 
 ## 2. 目录与模块职责
 
@@ -47,17 +50,21 @@ Backend/
 ├── README.md
 └── app/
     ├── main.py                  # 当前实际入口和全部 FastAPI 路由
+    ├── state_repository.py      # 用户、会话、消息、Token MySQL 仓储
     ├── knowledge_repository.py  # MySQL 知识库/文档仓储和序列化
     ├── knowledge_runtime.py     # 解析、Token 切片、Embedding、Milvus CRUD
+    ├── document_tasks.py        # Redis 队列、任务恢复和异步 Worker
     ├── db/
     │   ├── mysql.py             # SQLAlchemy 异步引擎和 Session
+    │   ├── redis.py             # Redis 异步客户端
     │   └── milvus.py            # Milvus 基础连接模块
     ├── models/
     │   ├── knowledge_base.py    # 当前启用的知识库 ORM 模型
     │   ├── knowledge_document.py# 当前启用的文档 ORM 模型
     │   ├── user.py
     │   ├── conversation.py
-    │   └── message.py           # 后三者为后续持久化准备，当前入口未使用
+    │   ├── message.py
+    │   └── document_task.py     # 均为当前运行模型
     ├── rag/
     │   └── retriever.py         # 实际 RAG 检索、预算裁剪、Prompt 格式化
     ├── api/                     # 分层路由骨架，当前请求仍由 main.py 承接
@@ -68,29 +75,29 @@ Backend/
 
 当前运行入口为 `app.main:app`。`api/`、`schemas/` 和 `services/` 中存在早期或
 预留的分层文件，但新增功能应以 `main.py` 的实际路由和本文为准，后续可逐步将
-入口中的内存业务拆入这些层。
+入口中的其余业务拆入这些层。
 
 ## 3. 启动生命周期
 
-FastAPI `lifespan` 在启动时执行 `init_knowledge_tables()`，仅创建当前知识库
-运行时拥有的两张表：
+FastAPI `lifespan` 在启动时执行 `init_state_tables()`，创建用户、会话、消息、
+知识库、文档和任务表，并在首次运行时写入系统管理员。随后启动 Redis 文档
+Worker；服务停止时取消 Worker，并释放 Redis 与 SQLAlchemy 连接。
 
-- `knowledge_bases`
-- `knowledge_documents`
-
-服务停止时释放 SQLAlchemy Engine 连接池。Milvus Collection 不在启动时全量
-重建；知识库通过 MySQL 中的 `collection_name` 恢复与已有 Collection 的映射。
+Milvus Collection 不在启动时全量重建；知识库通过 MySQL 中的
+`collection_name` 恢复与已有 Collection 的映射。
 
 ## 4. 认证、权限与隔离
 
 ### 认证
 
-- 登录接口生成随机 Bearer Token，并在内存中建立 Token 到用户 ID 的映射。
-- 连续 3 次密码错误后按用户名锁定 5 分钟，响应携带 `Retry-After`。
+- 密码使用 PBKDF2-SHA256 加盐哈希，不保存明文。
+- 登录签发有过期时间的 Access JWT 和 Refresh JWT。
+- Refresh Token 指纹保存在 Redis，可由 `/auth/logout` 主动吊销。
+- 连续 3 次密码错误后用 Redis TTL 按用户名锁定 5 分钟。
 - 登录成功后清除该用户名的失败记录。
 - 停用用户返回 HTTP 403。
 
-当前密码为开发版明文内存数据，不适合生产环境。
+默认管理员密码仍仅供本地开发，生产部署必须修改。
 
 ### 角色
 
@@ -185,15 +192,16 @@ Token 按用户统计：
 达到任一上限时在调用模型前返回 429。窗口到期自动清零，管理员也可用
 `five_hour`、`weekly` 或 `all` 手动重置窗口；累计用量不会随窗口重置而清除。
 
-## 7. 文档处理和入库架构
+## 7. 异步文档处理和入库架构
 
 支持 `.docx`、`.xlsx`、`.xls`、`.csv`、`.txt`、`.md` 和 `.pdf`，单文件最大
 30 MB。旧版 `.doc` 不受支持，需要先转换为 `.docx`。
 
-入库流水线：
+上传接口保存文件并返回 HTTP 202 和 `task_id`，Redis Worker 异步执行：
 
 ```text
-管理员上传 multipart 文件
+管理员上传 multipart 文件 → MySQL 创建 document_tasks
+  → Redis 队列原子出队
   → 校验知识库、大小、扩展名、切片参数
   → 提取文本
   → Excel 拼接全部工作表、字段和数据行
@@ -202,7 +210,11 @@ Token 按用户统计：
   → 写入对应 Milvus Collection
   → MySQL 写入文档元信息
   → 更新知识库 file_count / chunk_count
+  → 任务进度 100%，临时文件删除
 ```
+
+任务阶段和进度可通过 `GET /knowledge-bases/tasks/{task_id}` 查询。Worker 启动时
+会重新入队上次中断的 `queued/processing` 任务。
 
 切片参数：
 
@@ -244,7 +256,11 @@ Milvus Collection 主要字段：
 | --- | --- | --- |
 | `semantic` | Dense 候选 + MMR 重排 | 需要语义相关且减少重复切片 |
 | `dense` | Milvus COSINE 直接排名 | 单纯按向量相似度检索 |
-| `hybrid` | Dense + 本地 BM25，经 RRF 融合 | 同时重视语义和精确关键词 |
+| `hybrid` | Milvus Dense + BM25 Sparse，经 RRF 融合 | 语义和精确关键词 |
+
+Milvus 2.5 新 Collection 包含 `embedding` Dense 字段、`sparse` 字段和服务端
+BM25 Function。旧 Collection 没有 `sparse` 字段时自动回退到本地 BM25。
+配置 `RERANK_PROVIDER=dashscope` 后，初筛候选还会调用 `qwen3-rerank` 精排。
 
 检索流程：
 
@@ -267,7 +283,8 @@ Token 数、相关分数及是否被截断。Prompt 要求模型依据资料回�
 | 服务 | 镜像/版本 | 本机端口 | 用途 |
 | --- | --- | --- | --- |
 | MySQL | `mysql:8.0` | 3306 | 业务元信息 |
-| Milvus | `milvusdb/milvus:v2.4.23` | 19530、9091 | 向量和切片 |
+| Redis | `redis:7.4-alpine` | 6379 | 安全状态和任务队列 |
+| Milvus | `milvusdb/milvus:v2.5.18` | 19530、9091 | Dense/Sparse 向量 |
 | etcd | `quay.io/coreos/etcd:v3.5.5` | 容器网络 | Milvus 元数据 |
 | MinIO | `minio/minio` | 9000、9001 | Milvus 对象存储 |
 
@@ -284,15 +301,20 @@ Token 数、相关分数及是否被截断。Prompt 要求模型依据资料回�
 | `MYSQL_DATABASE` | 数据库名 | `rag_system` |
 | `MILVUS_HOST` | Milvus 主机 | `127.0.0.1` |
 | `MILVUS_PORT` | Milvus gRPC 端口 | `19530` |
+| `REDIS_URL` | 带密码的 Redis 地址 | 必填 |
 | `OPENAI_API_KEY` | 模型服务密钥 | 必填 |
 | `OPENAI_API_BASE` | OpenAI-compatible `/v1` 根地址 | 必填 |
 | `DEFAULT_MODEL` | 默认聊天模型 | 必填 |
 | `EMBEDDING_MODEL` | 向量模型 | 必填 |
+| `REFRESH_TOKEN_EXPIRE_DAYS` | Refresh Token 有效天数 | `7` |
+| `RERANK_PROVIDER` | `none` 或 `dashscope` | `none` |
+| `RERANK_MODEL` | 重排模型 | `qwen3-rerank` |
+| `RERANK_API_URL` | DashScope `/reranks` 地址 | 启用时必填 |
 | `AVAILABLE_MODELS` | 可选聊天模型允许列表 | 可选 |
 | `MODEL_PROVIDER` | 前端展示的服务商名称 | 可选 |
 
-`.env` 中还保留 JWT 相关配置键，但当前开发入口使用随机内存 Token，尚未接入
-正式 JWT。
+Compose 中 MySQL、Redis 和 MinIO 密码均从 `Backend/.env` 读取，不在仓库中
+保存真实凭据。
 
 ## 11. 启动、检查与停止
 
@@ -339,10 +361,10 @@ docker compose stop
 
 ## 12. 当前限制与下一步
 
-- 用户、认证、会话、消息和 Token 配额尚未持久化。
-- 密码尚未哈希，Bearer Token 不是 JWT。
+- 当前依靠 SQLAlchemy `create_all` 初始化，正式版本应使用 Alembic 管理迁移。
+- 文档 Worker 随 FastAPI 进程运行，高并发时应拆分为独立 Worker 部署。
 - 跨 MySQL/Milvus 只提供应用层补偿，不是原子事务。
-- BM25 候选在应用侧计算，超大知识库需要改为可扩展的稀疏索引方案。
+- 旧 Collection 仍使用应用层 BM25；需重新建库并重传文档才能获得 Sparse 索引。
 - 上游 Embedding 账户额度耗尽时，上传和启用 RAG 的检索会返回 502。
 - 下一阶段应优先完成用户/会话/配额 MySQL 迁移、数据库迁移工具、后台任务队列、
   幂等入库与集成测试。

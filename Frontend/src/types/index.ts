@@ -33,7 +33,9 @@ export interface RegisterForm {
 
 export interface TokenResponse {
   access_token: string
+  refresh_token: string
   token_type: string
+  expires_in: number
   user: User
 }
 
@@ -117,6 +119,25 @@ export interface KnowledgeDocument {
   created_at: string
 }
 
+export type DocumentTaskStatus = 'queued' | 'processing' | 'completed' | 'failed'
+
+export interface DocumentTask {
+  id: string
+  knowledge_base_id: number
+  file_name: string
+  file_size: number
+  chunk_tokens: number
+  overlap_tokens: number
+  status: DocumentTaskStatus
+  stage: string
+  progress: number
+  result_document_id: number | null
+  error: string | null
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
 export interface MilvusField {
   name: string
   type: string
@@ -150,6 +171,7 @@ export interface MilvusChunkPage {
   offset: number
   limit: number
   total: number
+  next_cursor: number | null
 }
 
 // 模型
