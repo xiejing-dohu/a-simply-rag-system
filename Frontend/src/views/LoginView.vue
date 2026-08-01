@@ -1,3 +1,4 @@
+<!-- 用户登录与公开注册视图组件 -->
 <template>
   <div class="login-container">
     <div class="login-box glass-card fade-in">
@@ -6,6 +7,7 @@
         <p>登入您的账户</p>
       </div>
 
+      <!-- 登录表单 -->
       <el-form :model="form" :rules="rules" ref="formRef" class="login-form">
         <el-form-item prop="username">
           <el-input v-model="form.username" placeholder="用户名" prefix-icon="User" size="large" />
@@ -23,6 +25,7 @@
       </div>
     </div>
 
+    <!-- 用户注册弹窗 -->
     <el-dialog
       v-model="registerVisible"
       title="注册普通用户"
@@ -88,16 +91,19 @@ const registerVisible = ref(false)
 const registerLoading = ref(false)
 const registerFormRef = ref<FormInstance>()
 
+// 登录表单数据
 const form = reactive({
   username: '',
   password: ''
 })
 
+// 登录表单校验规则
 const rules = {
   username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
   password: [{ required: true, message: '请输入密码', trigger: 'blur' }]
 }
 
+// 注册表单数据
 const registerForm = reactive({
   username: '',
   email: '',
@@ -105,6 +111,7 @@ const registerForm = reactive({
   confirmPassword: ''
 })
 
+// 校验两次密码输入一致性
 const validatePasswordConfirmation = (
   _rule: unknown,
   value: string,
@@ -115,6 +122,7 @@ const validatePasswordConfirmation = (
   else callback()
 }
 
+// 注册表单校验规则
 const registerRules = {
   username: [
     { required: true, message: '请输入用户名', trigger: 'blur' },
@@ -131,6 +139,7 @@ const registerRules = {
   confirmPassword: [{ validator: validatePasswordConfirmation, trigger: 'blur' }]
 }
 
+/** 提交登录句柄 */
 const handleLogin = async () => {
   if (!formRef.value) return
   await formRef.value.validate(async (valid) => {
@@ -150,10 +159,12 @@ const handleLogin = async () => {
   })
 }
 
+/** 打开注册弹窗 */
 const showRegister = () => {
   registerVisible.value = true
 }
 
+/** 重置注册表单 */
 const resetRegisterForm = () => {
   registerFormRef.value?.resetFields()
   registerForm.username = ''
@@ -162,6 +173,7 @@ const resetRegisterForm = () => {
   registerForm.confirmPassword = ''
 }
 
+/** 提交注册句柄 */
 const handleRegister = async () => {
   if (!registerFormRef.value || registerLoading.value) return
   try {

@@ -1,9 +1,11 @@
+<!-- 单条聊天消息渲染组件：支持 Markdown 渲染、代码高亮以及 RAG 检索引用切片展开展示 -->
 <template>
   <div class="message-wrapper" :class="{ 'is-user': isUser }">
     <div class="message-content" :class="{ 'glass-card': !isUser }">
       <div v-if="!isUser" class="avatar">
         <el-icon><Monitor /></el-icon>
       </div>
+      <!-- RAG 检索上下文与引用文档折叠面板 -->
       <details v-if="message.rag_context?.enabled" class="rag-context">
         <summary>
           {{ modeLabel }} · {{ message.rag_context.sources.length }} 个切片 ·
@@ -21,6 +23,7 @@
           <div class="source-text">{{ source.text }}</div>
         </div>
       </details>
+      <!-- 消息 Markdown 内容区 -->
       <div class="markdown-body" v-html="renderedContent"></div>
       <div class="timestamp">{{ timeText }}</div>
     </div>
@@ -39,7 +42,10 @@ const props = defineProps<{
   message: Message
 }>()
 
+// 判断消息发送者角色是否为当前用户
 const isUser = computed(() => props.message.role === 'user')
+
+// RAG 模式显示标签
 const modeLabel = computed(() => {
   const labels = {
     semantic: '语义检索',
@@ -51,6 +57,7 @@ const modeLabel = computed(() => {
     : ''
 })
 
+// 初始化 Markdown 解析器与 highlight.js 代码高亮插件
 const md = new MarkdownIt({
   highlight: function (str: string, lang: string) {
     if (lang && hljs.getLanguage(lang)) {
@@ -58,12 +65,14 @@ const md = new MarkdownIt({
         return hljs.highlight(str, { language: lang }).value
       } catch (__) {}
     }
-    return '' // use external default escaping
+    return ''
   }
 })
 
+// 计算解析后的 HTML 字符串
 const renderedContent = computed(() => md.render(props.message.content))
 
+// 格式化消息创建时间点
 const timeText = computed(() => {
   const date = new Date(props.message.created_at)
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -117,7 +126,7 @@ const timeText = computed(() => {
 
 .timestamp {
   font-size: 11px;
-  opacity: 0.6;
+  opacity: 0.78;
   margin-top: 8px;
   text-align: right;
 }
@@ -125,15 +134,15 @@ const timeText = computed(() => {
 .rag-context {
   margin-bottom: 12px;
   padding: 10px 12px;
-  border: 1px solid rgba(102, 126, 234, 0.28);
+  border: 1px solid rgba(139, 167, 255, 0.38);
   border-radius: 8px;
-  background: rgba(102, 126, 234, 0.08);
+  background: rgba(112, 148, 255, 0.12);
   font-size: 12px;
 }
 
 .rag-context summary {
   cursor: pointer;
-  color: var(--color-primary);
+  color: var(--color-primary-strong);
 }
 
 .rag-source {
@@ -154,7 +163,6 @@ const timeText = computed(() => {
   line-height: 1.5;
 }
 
-/* Markdown 样式简化 */
 ::v-deep(.markdown-body) {
   color: inherit;
   font-size: 14px;
@@ -162,7 +170,8 @@ const timeText = computed(() => {
 }
 ::v-deep(.markdown-body p) { margin-bottom: 12px; }
 ::v-deep(.markdown-body pre) {
-  background: #1e1e1e;
+  background: #07101d;
+  border: 1px solid var(--border-color);
   padding: 12px;
   border-radius: 8px;
   overflow-x: auto;

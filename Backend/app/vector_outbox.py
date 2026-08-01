@@ -1,3 +1,9 @@
+"""向量库 Outbox 异步事务调配 Worker 模块
+
+通过 MySQL Transactional Outbox 模式监听、调配与执行 Milvus Collection 的异步创建、删除与版本一致性检查，
+保障 Redis 异常宕机时向量数据的最终一致性。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -11,15 +17,18 @@ from app.models.document_task import DocumentTask
 from app.models.knowledge_base import KnowledgeBase
 from app.models.vector_operation import VectorOperation
 
+# 出队轮询间隔（秒）与超时阻断阈值（5分钟）
 POLL_INTERVAL_SECONDS = 1.0
 PROCESSING_TIMEOUT = timedelta(minutes=5)
 
 
 def utcnow() -> datetime:
+    """获取无时区 UTC 时间"""
     return datetime.now(UTC).replace(tzinfo=None)
 
 
 async def _claim_operation() -> str | None:
+    """抢占并锁定一条待处理 (pending/retry) 或僵死的 Outbox 异步任务记录"""
     now = utcnow()
     stale_before = now - PROCESSING_TIMEOUT
     async with async_session_maker() as session:
@@ -56,6 +65,7 @@ async def _claim_operation() -> str | None:
 
 
 async def _load_operation(operation_id: str) -> dict | None:
+    """加载正在处理中的 Outbox 任务数据字典"""
     async with async_session_maker() as session:
         operation = await session.get(VectorOperation, operation_id)
         if operation is None or operation.status != "processing":
@@ -70,6 +80,7 @@ async def _load_operation(operation_id: str) -> dict | None:
 
 
 async def _has_unfinished_create(resource_id: int, current_id: str) -> bool:
+    """检查知识库是否有未完成的集合创建任务"""
     async with async_session_maker() as session:
         result = await session.execute(
             select(VectorOperation.id).where(
@@ -83,6 +94,7 @@ async def _has_unfinished_create(resource_id: int, current_id: str) -> bool:
 
 
 async def _has_unfinished_document_task(resource_id: int) -> bool:
+    """检查知识库是否有排队或运行中的文档上传/切片任务"""
     async with async_session_maker() as session:
         result = await session.execute(
             select(DocumentTask.id).where(
@@ -94,6 +106,7 @@ async def _has_unfinished_document_task(resource_id: int) -> bool:
 
 
 async def _complete(operation_id: str) -> None:
+    """将 Outbox 任务标记为 completed，并同步更新 MySQL 知识库主表状态（如 active 或物理删除）"""
     async with async_session_maker() as session:
         operation = await session.get(
             VectorOperation, operation_id, with_for_update=True
@@ -116,6 +129,7 @@ async def _complete(operation_id: str) -> None:
 
 
 async def _retry(operation_id: str, exc: Exception) -> None:
+    """Outbox 任务失败后的指数退避重试逻辑及最大次数超限标记"""
     async with async_session_maker() as session:
         operation = await session.get(
             VectorOperation, operation_id, with_for_update=True
@@ -142,6 +156,7 @@ async def _retry(operation_id: str, exc: Exception) -> None:
 
 
 async def process_operation(operation_id: str) -> None:
+    """执行单个 Outbox 操作（创建/删除 Milvus Collection）"""
     payload = await _load_operation(operation_id)
     if payload is None:
         return
@@ -166,8 +181,10 @@ async def process_operation(operation_id: str) -> None:
 
 
 async def vector_outbox_worker(stop_event: asyncio.Event) -> None:
-    """Poll MySQL directly so Redis loss cannot lose a Milvus operation."""
+    """Outbox 定时轮询主循环 Worker
 
+    同时每隔 60 秒触发一次向量存储一致性对账。
+    """
     last_reconciliation = 0.0
     loop = asyncio.get_running_loop()
     while not stop_event.is_set():
@@ -187,12 +204,11 @@ async def vector_outbox_worker(stop_event: asyncio.Event) -> None:
 
 
 async def reconcile_vector_state() -> None:
-    """Detect active MySQL records whose Milvus collection disappeared.
+    """向量数据状态一致性对账逻辑
 
-    Missing vector data is never silently recreated as an empty collection.
-    The KB is fenced off and exposed as inconsistent for administrator action.
+    检测 MySQL 标记为 active 的知识库，若在 Milvus 中 Collection 缺失，
+    将其标记为 inconsistent 状态提示管理员修复。
     """
-
     async with async_session_maker() as session:
         result = await session.execute(
             select(KnowledgeBase.id, KnowledgeBase.collection_name).where(

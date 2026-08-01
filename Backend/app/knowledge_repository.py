@@ -1,9 +1,16 @@
+"""知识库与文档数据仓库模块
+
+封装 SQLAlchemy 数据库操作，包含知识库元数据 CRUD、文档元数据插入、
+向量异步 Outbox 事务记录生成（如创建/删除 Collection）及幂等控制。
+"""
+
 from __future__ import annotations
 
 import uuid
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.db.mysql import async_session_maker, engine
 from app.models.knowledge_base import KnowledgeBase
@@ -12,10 +19,19 @@ from app.models.vector_operation import VectorOperation
 
 
 async def close_knowledge_database() -> None:
+    """清理并释放 MySQL 数据库引擎连接池"""
     await engine.dispose()
 
 
 def serialize_knowledge_base(item: KnowledgeBase) -> dict[str, Any]:
+    """将 KnowledgeBase ORM 对象序列化为字典字典
+
+    Args:
+        item (KnowledgeBase): ORM 实体
+
+    Returns:
+        dict[str, Any]: 结构化 JSON 字典
+    """
     return {
         "id": item.id,
         "name": item.name,
@@ -33,6 +49,14 @@ def serialize_knowledge_base(item: KnowledgeBase) -> dict[str, Any]:
 
 
 def serialize_document(item: KnowledgeDocument) -> dict[str, Any]:
+    """将 KnowledgeDocument ORM 对象序列化为字典字典
+
+    Args:
+        item (KnowledgeDocument): ORM 实体
+
+    Returns:
+        dict[str, Any]: 结构化 JSON 字典
+    """
     return {
         "id": item.id,
         "name": item.name,
@@ -50,6 +74,11 @@ def serialize_document(item: KnowledgeDocument) -> dict[str, Any]:
 
 
 async def list_knowledge_bases() -> list[KnowledgeBase]:
+    """按创建时间倒序查询所有知识库列表
+
+    Returns:
+        list[KnowledgeBase]: 知识库实体列表
+    """
     async with async_session_maker() as session:
         result = await session.execute(
             select(KnowledgeBase).order_by(KnowledgeBase.created_at.desc())
@@ -58,6 +87,14 @@ async def list_knowledge_bases() -> list[KnowledgeBase]:
 
 
 async def get_knowledge_base(knowledge_base_id: int) -> KnowledgeBase | None:
+    """获取指定 ID 且状态为 active 的有效知识库
+
+    Args:
+        knowledge_base_id (int): 知识库 ID
+
+    Returns:
+        KnowledgeBase | None: 存在返回实体，否则返回 None
+    """
     async with async_session_maker() as session:
         result = await session.execute(
             select(KnowledgeBase).where(
@@ -71,6 +108,7 @@ async def get_knowledge_base(knowledge_base_id: int) -> KnowledgeBase | None:
 async def get_knowledge_base_any_status(
     knowledge_base_id: int,
 ) -> KnowledgeBase | None:
+    """查询任意状态（包括 creating/deleting）的知识库记录"""
     async with async_session_maker() as session:
         return await session.get(KnowledgeBase, knowledge_base_id)
 
@@ -84,6 +122,11 @@ async def create_knowledge_base_record(
     vector_dimension: int,
     created_by: int,
 ) -> KnowledgeBase:
+    """原子化创建知识库记录并写入创建 Collection 的 Outbox 事务记录
+
+    Returns:
+        KnowledgeBase: 新建的知识库实体
+    """
     async with async_session_maker() as session:
         item = KnowledgeBase(
             name=name,
@@ -96,6 +139,7 @@ async def create_knowledge_base_record(
         )
         session.add(item)
         await session.flush()
+        # 写入 VectorOperation 事务收件箱
         session.add(
             VectorOperation(
                 id=str(uuid.uuid4()),
@@ -115,8 +159,14 @@ async def create_knowledge_base_record(
 async def request_knowledge_base_deletion(
     knowledge_base_id: int,
 ) -> VectorOperation | None:
-    """Atomically mark a KB unavailable and append its Milvus drop operation."""
+    """原子化标记知识库状态为 deleting，并向 Outbox 插入删除 Milvus Collection 的异步操作记录
 
+    Args:
+        knowledge_base_id (int): 知识库 ID
+
+    Returns:
+        VectorOperation | None: 向量 Outbox 任务实体，知识库不存在则返回 None
+    """
     async with async_session_maker() as session:
         item = await session.get(
             KnowledgeBase, knowledge_base_id, with_for_update=True
@@ -145,6 +195,7 @@ async def request_knowledge_base_deletion(
             operation.next_attempt_at = None
             operation.last_error = None
         item.status = "deleting"
+        # 取消未完成的创建操作
         pending_create = await session.execute(
             select(VectorOperation).where(
                 VectorOperation.resource_type == "knowledge_base",
@@ -162,11 +213,13 @@ async def request_knowledge_base_deletion(
 
 
 async def get_vector_operation(operation_id: str) -> VectorOperation | None:
+    """根据 ID 查询指定向量 Outbox 操作"""
     async with async_session_maker() as session:
         return await session.get(VectorOperation, operation_id)
 
 
 def serialize_vector_operation(item: VectorOperation) -> dict[str, Any]:
+    """序列化 VectorOperation ORM 实例为字典"""
     return {
         "id": item.id,
         "operation_type": item.operation_type,
@@ -183,6 +236,14 @@ def serialize_vector_operation(item: VectorOperation) -> dict[str, Any]:
 
 
 async def list_documents(knowledge_base_id: int) -> list[KnowledgeDocument]:
+    """获取指定知识库下所有文档记录
+
+    Args:
+        knowledge_base_id (int): 知识库 ID
+
+    Returns:
+        list[KnowledgeDocument]: 文档实体列表
+    """
     async with async_session_maker() as session:
         result = await session.execute(
             select(KnowledgeDocument)
@@ -194,6 +255,7 @@ async def list_documents(knowledge_base_id: int) -> list[KnowledgeDocument]:
 
 async def add_document_record(
     *,
+    ingestion_id: str,
     knowledge_base_id: int,
     name: str,
     size: int,
@@ -206,8 +268,27 @@ async def add_document_record(
     vector_dimension: int,
     embedding_model: str,
 ) -> KnowledgeDocument:
+    """幂等写入导入完成的文档元数据，并原子累加知识库的文档数与切片数
+
+    Args:
+        ingestion_id (str): 导入任务的唯一标识 ID
+        knowledge_base_id (int): 所属知识库 ID
+        ...
+
+    Returns:
+        KnowledgeDocument: 已持久化的文档记录
+    """
     async with async_session_maker() as session:
+        existing = await session.execute(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.ingestion_id == ingestion_id
+            )
+        )
+        existing_item = existing.scalar_one_or_none()
+        if existing_item is not None:
+            return existing_item
         item = KnowledgeDocument(
+            ingestion_id=ingestion_id,
             knowledge_base_id=knowledge_base_id,
             name=name,
             size=size,
@@ -228,6 +309,18 @@ async def add_document_record(
             raise LookupError("知识库不存在")
         knowledge_base.file_count += 1
         knowledge_base.chunk_count += chunk_count
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            duplicate = await session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.ingestion_id == ingestion_id
+                )
+            )
+            duplicate_item = duplicate.scalar_one_or_none()
+            if duplicate_item is None:
+                raise
+            return duplicate_item
         await session.refresh(item)
         return item

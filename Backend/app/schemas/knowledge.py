@@ -1,19 +1,14 @@
-from pydantic import BaseModel
-from typing import Optional
-from datetime import datetime
+"""知识库 API 数据契约模块
 
-class KBCreate(BaseModel):
-    name: str
-    description: Optional[str] = None
+包含创建知识库相关的 Pydantic Schema。
+"""
 
-class KBResponse(BaseModel):
-    id: int
-    name: str
-    description: Optional[str] = None
-    collection_name: str
-    file_count: int
-    created_by: int
-    created_at: datetime
+from pydantic import BaseModel, Field
 
-    class Config:
-        from_attributes = True
+
+class KnowledgeBaseCreate(BaseModel):
+    """创建知识库请求 Schema"""
+
+    name: str = Field(min_length=1, max_length=100, description="知识库名称")
+    description: str | None = Field(default="", description="知识库描述")
+    vector_dimension: int = Field(default=1024, ge=64, le=4096, description="向量维度大小")

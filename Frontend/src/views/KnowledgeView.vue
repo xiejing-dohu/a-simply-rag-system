@@ -1,3 +1,4 @@
+<!-- 知识库列表卡片管理、文档异步上传向量化与 Milvus 切片深探探测视图组件 -->
 <template>
   <div class="knowledge-container">
     <div class="header">
@@ -13,6 +14,7 @@
       </el-button>
     </div>
 
+    <!-- 知识库卡片列表 -->
     <el-empty v-if="!kbStore.knowledgeBases.length" description="暂无知识库" />
     <div v-else class="kb-grid">
       <div v-for="kb in kbStore.knowledgeBases" :key="kb.id" class="kb-card glass-card slide-up">
@@ -61,6 +63,7 @@
       </div>
     </div>
 
+    <!-- 创建知识库弹窗 -->
     <el-dialog v-model="dialogVisible" title="创建知识库" width="460px">
       <el-form :model="form" label-width="100px">
         <el-form-item label="名称">
@@ -87,6 +90,7 @@
       </template>
     </el-dialog>
 
+    <!-- 上传文档并向量化弹窗 -->
     <el-dialog
       v-model="uploadVisible"
       title="上传文档并向量化"
@@ -153,6 +157,7 @@
       </template>
     </el-dialog>
 
+    <!-- Milvus 抽屉探针页面 -->
     <el-drawer v-model="dataVisible" size="75%" title="Milvus 数据查看">
       <div v-if="dataTarget" class="drawer-head">
         <div>
@@ -232,6 +237,7 @@ const uploadForm = reactive({ chunkTokens: 512, overlapTokens: 64 })
 const acceptedExtensions = computed(() =>
   (kbStore.embeddingConfig?.supported_extensions || []).join(',')
 )
+
 const stageNames: Record<string, string> = {
   queued: '等待处理',
   parsing: '正在解析文档',
@@ -250,11 +256,13 @@ const statusText: Record<string, string> = {
   delete_failed: '删除失败',
   inconsistent: '数据不一致'
 }
+
 const statusTagType = (status: string) => {
   if (status === 'active') return 'success'
   if (status.endsWith('failed')) return 'danger'
   return 'warning'
 }
+
 const taskStageText = computed(() =>
   stageNames[uploadTask.value?.stage || 'queued'] || '处理中'
 )
@@ -273,6 +281,7 @@ onMounted(async () => {
   }
 })
 
+/** 创建知识库提交句柄 */
 const handleCreate = async () => {
   if (!form.name.trim()) return ElMessage.warning('请输入名称')
   creating.value = true
@@ -297,6 +306,7 @@ const handleCreate = async () => {
   }
 }
 
+/** 删除知识库提交句柄 */
 const handleDelete = async (id: number) => {
   try {
     await ElMessageBox.confirm('将同时删除 Milvus 集合及其中的全部向量，是否继续？', '删除知识库', {
@@ -313,6 +323,7 @@ const handleDelete = async (id: number) => {
   }
 }
 
+/** 打开上传弹窗 */
 const openUpload = (kb: KnowledgeBase) => {
   uploadTarget.value = kb
   uploadVisible.value = true
@@ -334,6 +345,7 @@ const resetUpload = () => {
   uploadForm.overlapTokens = 64
 }
 
+/** 上传文档并轮询异步生成进度 */
 const handleUpload = async () => {
   if (!uploadTarget.value || !selectedFile.value) return ElMessage.warning('请选择文件')
   if (uploadForm.overlapTokens >= uploadForm.chunkTokens) {
@@ -368,6 +380,7 @@ const handleUpload = async () => {
   }
 }
 
+/** 读取 Milvus 底层 Schema 与向量切片 */
 const loadMilvusData = async (cursor: number | null = null, page = 1) => {
   if (!dataTarget.value) return
   dataLoading.value = true

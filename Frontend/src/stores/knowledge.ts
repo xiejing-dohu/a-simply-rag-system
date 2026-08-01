@@ -1,3 +1,5 @@
+/** 知识库、文档上传解析与向量调试探测 Pinia 状态管理模块 */
+
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import {
@@ -20,19 +22,24 @@ import type {
 } from '../types'
 
 export const useKnowledgeStore = defineStore('knowledge', () => {
+  // 知识库列表
   const knowledgeBases = ref<KnowledgeBase[]>([])
+  // Embedding 模型配置信息
   const embeddingConfig = ref<EmbeddingConfig | null>(null)
 
+  /** 加载系统 Embedding 维度与扩展名配置 */
   const fetchEmbeddingConfig = async () => {
     const res = await getEmbeddingConfig()
     embeddingConfig.value = res.data
   }
 
+  /** 获取知识库列表 */
   const fetchKnowledgeBases = async () => {
     const res = await getKnowledgeBases()
     knowledgeBases.value = res.data
   }
 
+  /** 创建知识库并轮询等待 Milvus Collection 初始化完成 */
   const createKnowledgeBaseAction = async (
     name: string,
     description: string,
@@ -58,6 +65,7 @@ export const useKnowledgeStore = defineStore('knowledge', () => {
     return false
   }
 
+  /** 请求删除知识库并轮询向量 Outbox 任务清理完毕 */
   const deleteKnowledgeBaseAction = async (id: number) => {
     const response = await deleteKnowledgeBase(id)
     await fetchKnowledgeBases()
@@ -79,6 +87,7 @@ export const useKnowledgeStore = defineStore('knowledge', () => {
     return true
   }
 
+  /** 上传文档并创建异步任务 */
   const uploadDocumentAction = async (
     kbId: number,
     file: File,
@@ -89,16 +98,19 @@ export const useKnowledgeStore = defineStore('knowledge', () => {
     return res.data.task
   }
 
+  /** 查询文档处理异步任务进度 */
   const fetchDocumentTask = async (taskId: string): Promise<DocumentTask> => {
     const res = await getDocumentTask(taskId)
     return res.data
   }
 
+  /** 获取 Milvus 结构信息 */
   const fetchMilvusSchema = async (kbId: number): Promise<MilvusSchema> => {
     const res = await getMilvusSchema(kbId)
     return res.data
   }
 
+  /** 获取 Milvus 存储切片记录 */
   const fetchMilvusChunks = async (
     kbId: number,
     offset = 0,

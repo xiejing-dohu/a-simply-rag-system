@@ -10,10 +10,11 @@ Python 依赖和虚拟环境统一由 `uv` 管理。
 Vue 前端
   │ REST / SSE
   ▼
-FastAPI（app/main.py）
-  ├─ JWT、角色、会话归属、Token 配额
+FastAPI（app/main.py 应用工厂）
+  ├─ api/：认证、聊天、知识库、模型与系统路由
+  ├─ services/：模型发现、OpenAI-compatible 流式调用
+  ├─ schemas/：按领域划分的请求/响应契约
   ├─ Redis：Refresh Token、登录锁定、任务唤醒提示
-  ├─ OpenAI-compatible /models 与 /chat/completions
   ├─ knowledge_repository.py ── SQLAlchemy async ── MySQL
   ├─ knowledge_runtime.py ───── 文档解析 / Embedding ── Milvus
   └─ rag/retriever.py ───────── Dense / MMR / BM25 + RRF
@@ -53,7 +54,14 @@ Backend/
 ├── tests/                       # HTTP 与 Worker 集成测试
 ├── README.md
 └── app/
-    ├── main.py                  # 当前实际入口和全部 FastAPI 路由
+    ├── main.py                  # 应用工厂、生命周期、中间件、Router 注册
+    ├── api/
+    │   ├── dependencies.py      # JWT 当前用户和管理员依赖
+    │   ├── auth.py              # 认证、用户、配额路由
+    │   ├── chat.py              # 会话、RAG 设置、SSE 路由
+    │   ├── knowledge.py         # 知识库、任务和 Milvus 浏览路由
+    │   ├── model.py             # 模型发现路由
+    │   └── system.py            # 根路由和健康检查
     ├── state_repository.py      # 用户、会话、消息、Token MySQL 仓储
     ├── knowledge_repository.py  # MySQL 知识库/文档仓储和序列化
     ├── knowledge_runtime.py     # 解析、Token 切片、Embedding、Milvus CRUD
@@ -62,8 +70,7 @@ Backend/
     ├── worker.py                # 独立 Worker 进程入口
     ├── db/
     │   ├── mysql.py             # SQLAlchemy 异步引擎和 Session
-    │   ├── redis.py             # Redis 异步客户端
-    │   └── milvus.py            # Milvus 基础连接模块
+    │   └── redis.py             # Redis 异步客户端
     ├── models/
     │   ├── knowledge_base.py    # 当前启用的知识库 ORM 模型
     │   ├── knowledge_document.py# 当前启用的文档 ORM 模型
@@ -73,15 +80,16 @@ Backend/
     │   └── document_task.py     # 均为当前运行模型
     ├── rag/
     │   └── retriever.py         # 实际 RAG 检索、预算裁剪、Prompt 格式化
-    ├── api/                     # 分层路由骨架，当前请求仍由 main.py 承接
-    ├── core/                    # 配置、安全、依赖模块
-    ├── schemas/                 # 分层 Pydantic Schema 骨架
-    └── services/                # 分层业务服务骨架
+    ├── core/                    # 配置、安全和共享异常
+    ├── schemas/                 # auth/chat/knowledge Pydantic 契约
+    └── services/
+        ├── model_catalog.py     # 模型发现、过滤和缓存
+        └── chat_completion.py   # 上游 SSE 调用、重试和解析
 ```
 
-当前运行入口为 `app.main:app`。`api/`、`schemas/` 和 `services/` 中存在早期或
-预留的分层文件，但新增功能应以 `main.py` 的实际路由和本文为准，后续可逐步将
-入口中的其余业务拆入这些层。
+当前运行入口仍为 `app.main:app`，但 `main.py` 只负责组装。新增 HTTP 接口放在
+`api/`，输入输出契约放在 `schemas/`，外部模型调用放在 `services/`，存储访问放在
+Repository 或任务模块，避免再次把业务堆进入口文件。
 
 ## 3. 启动生命周期
 
@@ -102,7 +110,8 @@ Milvus Collection 不在启动时全量重建；知识库通过 MySQL 中的
 - 密码使用 PBKDF2-SHA256 加盐哈希，不保存明文。
 - 登录签发有过期时间的 Access JWT 和 Refresh JWT。
 - Refresh Token 指纹保存在 Redis，可由 `/auth/logout` 主动吊销。
-- 连续 3 次密码错误后用 Redis TTL 按用户名锁定 5 分钟。
+- 用户名在注册、登录和 Redis 锁键中统一执行首尾去空格及小写化；大小写变体不能绕过锁定。
+- 连续 3 次密码错误后用 Redis TTL 按规范化用户名锁定 5 分钟。
 - 登录成功后清除该用户名的失败记录。
 - 停用用户返回 HTTP 403。
 
@@ -225,6 +234,8 @@ Token 按用户统计：
 
 任务阶段和进度可通过 `GET /knowledge-bases/tasks/{task_id}` 查询。Worker
 每 30 秒更新租约心跳；进程异常退出后，其他 Worker 会在租约过期后重新领取。
+Worker 被取消时会先把任务恢复为 `queued` 并保留临时文件，下一实例可继续处理；
+只有任务完成或确定失败后才删除临时文件。
 `DOCUMENT_WORKER_CONCURRENCY` 控制单个 Worker 服务内的文档并发数。
 
 切片参数：
@@ -240,7 +251,8 @@ Milvus Collection 主要字段：
 
 | 字段 | 说明 |
 | --- | --- |
-| `id` | 自动生成主键 |
+| `id` | 由 `task_id + chunk_index` 生成的稳定 INT64 主键 |
+| `document_id` | 文档入库任务 UUID |
 | `text` | 切片原文 |
 | `document_name` | 来源文件 |
 | `source_type` | 来源扩展名 |
@@ -264,7 +276,9 @@ Milvus Collection 主要字段：
   `inconsistent`，不会静默创建一个空集合掩盖数据丢失。
 
 MySQL 与 Milvus 仍不支持原生分布式事务，因此保证的是可恢复的最终一致性。
-文档切片写入目前仍使用写入失败后的主键补偿删除。
+文档切片使用稳定主键和 Milvus `upsert`，MySQL 文档元信息使用唯一
+`ingestion_id`，Worker 在任意阶段重试都不会重复增加切片或统计；最终失败仍会按
+稳定主键执行补偿删除。
 
 ## 8. RAG 检索架构
 
@@ -401,8 +415,7 @@ docker compose stop
 
 - 数据库现由 Alembic 管理，部署必须先执行 `alembic upgrade head`。
 - Worker 已独立部署，可通过副本数及 `DOCUMENT_WORKER_CONCURRENCY` 扩容。
-- 知识库生命周期使用 Saga/Outbox 最终一致性；切片入库仍使用补偿删除。
-- 旧 Collection 仍使用应用层 BM25；需重新建库并重传文档才能获得 Sparse 索引。
+- 知识库生命周期使用 Saga/Outbox，文档切片使用稳定 ID + upsert 保证幂等重试。
+- 旧 Collection 仍可检索，但 auto-ID 主键无法原地改造；上传会被明确拒绝，需新建
+  知识库并迁移文档后才能获得幂等入库和 Sparse 索引。
 - 上游 Embedding 账户额度耗尽时，上传和启用 RAG 的检索会返回 502。
-- 下一阶段应将切片主键改为客户端确定的稳定 ID 后使用 Milvus upsert，使文档
-  入库也具备完整 Outbox 幂等语义。

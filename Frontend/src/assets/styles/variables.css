@@ -1,18 +1,24 @@
 :root {
   /* 背景 */
-  --bg-dark: #0a0a0f;
-  --bg-panel: #12121a;
-  --bg-card: #1a1a2e;
-  --bg-glass: rgba(26, 26, 46, 0.6);
+  --bg-dark: #08111f;
+  --bg-panel: #111d30;
+  --bg-card: #17263d;
+  --bg-elevated: #1d2e49;
+  --bg-glass: rgba(17, 29, 48, 0.94);
+  --bg-hover: rgba(148, 163, 184, 0.12);
+  --bg-active: rgba(124, 156, 255, 0.18);
   
   /* 主色 */
-  --color-primary-start: #667eea;
-  --color-primary-end: #764ba2;
-  --color-primary: #667eea;
+  --color-primary-start: #7094ff;
+  --color-primary-end: #a77bf3;
+  --color-primary: #8ba7ff;
+  --color-primary-strong: #a9bcff;
   
   /* 文本 */
-  --text-primary: #ffffff;
-  --text-secondary: #a0a0b0;
+  --text-primary: #f8fafc;
+  --text-regular: #dbe5f1;
+  --text-secondary: #b8c5d6;
+  --text-muted: #91a2b8;
   
   /* 圆角 */
   --radius-sm: 8px;
@@ -21,12 +27,13 @@
   --radius-xl: 24px;
   
   /* 阴影 */
-  --shadow-sm: 0 4px 6px rgba(0, 0, 0, 0.1);
-  --shadow-md: 0 8px 15px rgba(0, 0, 0, 0.2);
-  --shadow-lg: 0 15px 25px rgba(0, 0, 0, 0.3);
+  --shadow-sm: 0 4px 10px rgba(0, 0, 0, 0.22);
+  --shadow-md: 0 10px 24px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 18px 42px rgba(0, 0, 0, 0.38);
   
   /* 边框 */
-  --border-color: rgba(255, 255, 255, 0.1);
+  --border-color: rgba(174, 190, 211, 0.24);
+  --border-color-strong: rgba(174, 190, 211, 0.38);
   
   /* 动画过渡 */
   --transition-fast: 0.2s ease;

@@ -1,3 +1,8 @@
+"""数据模型统一导出模块
+
+导出 SQLAlchemy ORM 数据表映射模型。
+"""
+
 from app.db.mysql import Base
 from app.models.user import User
 from app.models.knowledge_base import KnowledgeBase

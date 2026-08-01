@@ -1,14 +1,27 @@
+/** Axios HTTP 请求客户端与拦截器封装模块
+
+包含请求 Authorization Token 自动注入、401 自动无感刷新 Access Token、
+以及刷新失败自动清理 Session 重定向登录页逻辑。
+*/
+
 import axios, { type AxiosError, type InternalAxiosRequestConfig } from 'axios'
+import { API_BASE_URL } from '../config/runtime'
 
-export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+export { API_BASE_URL }
 
+// 创建全局 Axios 实例
 const request = axios.create({
   baseURL: API_BASE_URL,
   timeout: 10000
 })
 
+// 并发刷新 Token 锁 Promise
 let refreshPromise: Promise<string> | null = null
 
+/**
+ * 刷新 Access Token
+ * @returns {Promise<string>} 返回最新 Access Token
+ */
 export const refreshAccessToken = async (): Promise<string> => {
   if (refreshPromise) return refreshPromise
   const refreshToken = localStorage.getItem('refresh_token')
@@ -28,17 +41,20 @@ export const refreshAccessToken = async (): Promise<string> => {
   return refreshPromise
 }
 
+/** 清理本地登录会话状态 */
 const clearSession = () => {
   localStorage.removeItem('token')
   localStorage.removeItem('refresh_token')
 }
 
+// 请求拦截器：向 Authorization 请求头注入 Bearer Token
 request.interceptors.request.use(config => {
   const token = localStorage.getItem('token')
   if (token) config.headers.Authorization = `Bearer ${token}`
   return config
 })
 
+// 响应拦截器：处理 401 未授权自动刷新 Token 与无感重试
 request.interceptors.response.use(
   response => response,
   async (error: AxiosError) => {

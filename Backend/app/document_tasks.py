@@ -1,3 +1,9 @@
+"""文档处理异步任务模块
+
+包含文件上传落盘、任务入队、Worker 抢占与心跳维持、
+文档文本解析、Token 切片、生成嵌入向量以及幂等写入 Milvus/MySQL 的核心异步处理流程。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -17,22 +23,30 @@ from app.knowledge_runtime import (
     embed_texts,
     extract_document,
     insert_chunks,
+    require_idempotent_collection,
     split_text_by_tokens,
 )
 from app.models.document_task import DocumentTask
 
+# Redis 队列 Key
 QUEUE_KEY = "documents:queue"
+# 上传文件临时存储根目录
 UPLOAD_ROOT = Path(__file__).resolve().parents[1] / "data" / "uploads"
+# 单个文件上传限制大小 (30 MB)
 MAX_FILE_SIZE = 30 * 1024 * 1024
+# 任务租约超时时间（2分钟未收到心跳判定为僵死）
 TASK_LEASE_TIMEOUT = timedelta(minutes=2)
+# 心跳刷新间隔（30秒）
 HEARTBEAT_INTERVAL_SECONDS = 30
 
 
 def utcnow() -> datetime:
+    """获取无时区 UTC 时间"""
     return datetime.now(UTC).replace(tzinfo=None)
 
 
 def serialize_task(item: DocumentTask) -> dict[str, Any]:
+    """将 DocumentTask 实体序列化为字典对象"""
     return {
         "id": item.id,
         "knowledge_base_id": item.knowledge_base_id,
@@ -53,6 +67,15 @@ def serialize_task(item: DocumentTask) -> dict[str, Any]:
 
 
 async def save_upload(upload_file, task_id: str) -> tuple[Path, int]:
+    """保存前端上传的二进制流到本地临时目录
+
+    Args:
+        upload_file: FastAPI / Starlette UploadFile 对象
+        task_id (str): 关联的任务 UUID
+
+    Returns:
+        tuple[Path, int]: (保存的临时文件路径, 文件字节大小)
+    """
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     path = UPLOAD_ROOT / f"{task_id}.upload"
     size = 0
@@ -88,6 +111,7 @@ async def create_task(
     chunk_tokens: int,
     overlap_tokens: int,
 ) -> DocumentTask:
+    """在数据库中创建排队状态的文档处理任务记录"""
     async with async_session_maker() as session:
         item = DocumentTask(
             id=task_id,
@@ -107,10 +131,12 @@ async def create_task(
 
 
 async def enqueue_task(task_id: str) -> None:
+    """将任务 ID 推入 Redis 唤醒队列"""
     await redis_client.rpush(QUEUE_KEY, task_id)
 
 
 async def get_task(task_id: str, user_id: int, is_admin: bool) -> DocumentTask | None:
+    """查询指定任务（增加权限控制：管理员可看全局，普通员工仅能看本人任务）"""
     async with async_session_maker() as session:
         result = await session.execute(
             select(DocumentTask).where(DocumentTask.id == task_id)
@@ -122,6 +148,7 @@ async def get_task(task_id: str, user_id: int, is_admin: bool) -> DocumentTask |
 
 
 async def _set_task(task_id: str, **changes: Any) -> None:
+    """原子化更新任务状态、阶段与进度百分比"""
     async with async_session_maker() as session:
         item = await session.get(DocumentTask, task_id, with_for_update=True)
         if item is None:
@@ -134,8 +161,7 @@ async def _set_task(task_id: str, **changes: Any) -> None:
 
 
 async def claim_task(task_id: str | None = None) -> str | None:
-    """Atomically claim a queued task or reclaim an expired processing lease."""
-
+    """从数据库抢占一个待处理的任务（包含过期的超时租约任务）"""
     now = utcnow()
     stale_before = now - TASK_LEASE_TIMEOUT
     eligible = or_(
@@ -175,6 +201,7 @@ async def claim_task(task_id: str | None = None) -> str | None:
 
 
 async def _heartbeat(task_id: str) -> None:
+    """任务处理后台续约心跳循环"""
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         async with async_session_maker() as session:
@@ -186,6 +213,11 @@ async def _heartbeat(task_id: str) -> None:
 
 
 async def process_task(task_id: str) -> None:
+    """文档处理流水线主函数
+
+    依次执行：文件读取 -> 文本提取 (parsing) -> Token 切片 (splitting)
+    -> 向量化生成 (embedding) -> Milvus upsert (milvus) -> 数据库元数据持久化 (metadata)。
+    """
     async with async_session_maker() as session:
         task = await session.get(DocumentTask, task_id)
         if task is None or task.status != "processing":
@@ -204,10 +236,14 @@ async def process_task(task_id: str) -> None:
     primary_keys: list[int] = []
     path = Path(payload["temp_path"])
     heartbeat = asyncio.create_task(_heartbeat(task_id))
+    cleanup_file = False
     try:
         knowledge_base = await get_knowledge_base(payload["knowledge_base_id"])
         if knowledge_base is None:
             raise LookupError("知识库不存在")
+        await asyncio.to_thread(
+            require_idempotent_collection, knowledge_base.collection_name
+        )
         content = await asyncio.to_thread(path.read_bytes)
         text, source_type = await asyncio.to_thread(
             extract_document, payload["file_name"], content
@@ -236,11 +272,13 @@ async def process_task(task_id: str) -> None:
             payload["file_name"],
             source_type,
             payload["created_by"],
+            task_id,
         )
 
         await _set_task(task_id, stage="metadata", progress=92)
         try:
             document = await add_document_record(
+                ingestion_id=task_id,
                 knowledge_base_id=payload["knowledge_base_id"],
                 name=payload["file_name"],
                 size=payload["file_size"],
@@ -267,6 +305,20 @@ async def process_task(task_id: str) -> None:
             finished_at=utcnow(),
             heartbeat_at=None,
         )
+        cleanup_file = True
+    except asyncio.CancelledError:
+        await asyncio.shield(
+            _set_task(
+                task_id,
+                status="queued",
+                stage="queued",
+                progress=0,
+                error="Worker 已停止，任务等待重新处理",
+                finished_at=None,
+                heartbeat_at=None,
+            )
+        )
+        raise
     except Exception as exc:
         await _set_task(
             task_id,
@@ -276,17 +328,18 @@ async def process_task(task_id: str) -> None:
             finished_at=utcnow(),
             heartbeat_at=None,
         )
+        cleanup_file = True
     finally:
         heartbeat.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat
-        with suppress(OSError):
-            path.unlink(missing_ok=True)
+        if cleanup_file:
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
 
 
 async def document_worker(stop_event: asyncio.Event) -> None:
-    """Use Redis as a wake-up hint and MySQL as the durable source of truth."""
-
+    """文档处理 Worker 轮询逻辑（Redis 作为提速提醒，MySQL 作为可靠持久源）"""
     while not stop_event.is_set():
         hinted_task_id: str | None = None
         try:

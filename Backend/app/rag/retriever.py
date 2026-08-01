@@ -1,3 +1,13 @@
+"""RAG 知识检索与重排序算法核心模块
+
+支持三种检索模式：
+1. dense (向量余弦相似度密集检索)
+2. semantic (结合 MMR 最大边际相关性算法的多样性向量检索)
+3. hybrid (混合检索：融合文本 BM25 词频与 Dense 向量 RRF 倒数排名融合)
+
+检索完成后支持应用 Token 预算裁剪与生成标准 RAG 提示词。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,8 +22,10 @@ from pymilvus import Collection
 from app.knowledge_runtime import connect_milvus, embed_texts
 from app.rag.reranker import rerank_candidates
 
-
+# 检索模式类型声明
 RetrievalMode = Literal["semantic", "dense", "hybrid"]
+
+# Milvus 检索输出的字段列表
 OUTPUT_FIELDS = [
     "id",
     "text",
@@ -23,10 +35,13 @@ OUTPUT_FIELDS = [
     "token_count",
     "created_at",
 ]
+
+# tiktoken 编码器（计算上下文 Token 数量）
 _encoding = tiktoken.get_encoding("cl100k_base")
 
 
 def _hit_to_dict(hit: Any) -> dict[str, Any]:
+    """将 Milvus Search 返回的 Hit 对象转为字典结构"""
     item = {field: hit.entity.get(field) for field in OUTPUT_FIELDS}
     item["score"] = float(hit.distance)
     item["embedding"] = hit.entity.get("embedding")
@@ -38,6 +53,7 @@ def _dense_candidates(
     query_vector: list[float],
     candidate_limit: int,
 ) -> list[dict[str, Any]]:
+    """从 Milvus 中进行纯向量余弦相似度（Dense Search）检索候选集"""
     connect_milvus()
     collection = Collection(collection_name)
     collection.load()
@@ -55,6 +71,7 @@ def _dense_candidates(
 
 
 def _cosine(left: np.ndarray, right: np.ndarray) -> float:
+    """计算两个向量的余弦相似度"""
     denominator = float(np.linalg.norm(left) * np.linalg.norm(right))
     return float(np.dot(left, right) / denominator) if denominator else 0.0
 
@@ -65,6 +82,7 @@ def _mmr_rank(
     limit: int,
     lambda_mult: float = 0.72,
 ) -> list[dict[str, Any]]:
+    """使用 MMR (Maximal Marginal Relevance) 算法实现兼顾相关性与多样性的重排"""
     if not candidates:
         return []
     query = np.asarray(query_vector, dtype=np.float32)
@@ -103,6 +121,7 @@ def _lexical_candidates(
     query_text: str,
     pool_limit: int = 2000,
 ) -> list[dict[str, Any]]:
+    """在内存中使用 BM25 词频计算公式对候选切片进行传统文本关键词检索"""
     connect_milvus()
     collection = Collection(collection_name)
     collection.load()
@@ -160,7 +179,7 @@ def _sparse_candidates(
     query_text: str,
     candidate_limit: int,
 ) -> list[dict[str, Any]] | None:
-    """Use Milvus BM25 for new collections; return None for legacy schemas."""
+    """使用 Milvus 自带的 BM25 稀疏向量索引（针对新 Collection），如果是旧结构返回 None"""
     connect_milvus()
     collection = Collection(collection_name)
     if "sparse" not in {field.name for field in collection.schema.fields}:
@@ -189,6 +208,7 @@ def _hybrid_rank(
     lexical: list[dict[str, Any]],
     limit: int,
 ) -> list[dict[str, Any]]:
+    """使用 RRF (Reciprocal Rank Fusion 倒数排名融合) 融合 Dense 与 BM25 结果"""
     by_id: dict[int, dict[str, Any]] = {}
     fused_scores: Counter[int] = Counter()
     rrf_constant = 60
@@ -210,6 +230,7 @@ def _apply_token_budget(
     ranked: list[dict[str, Any]],
     max_tokens: int,
 ) -> tuple[list[dict[str, Any]], int]:
+    """对检索到的切片应用 Token 预算，超过上限部分自动截断"""
     selected: list[dict[str, Any]] = []
     used_tokens = 0
     for item in ranked:
@@ -246,6 +267,19 @@ async def retrieve_context(
     max_tokens: int,
     result_limit: int | None = None,
 ) -> dict[str, Any]:
+    """主检索入口：向量化 Query 并根据 mode 进行检索、混合融合与 Rerank 重排序
+
+    Args:
+        collection_name (str): Milvus 集合名称
+        query_text (str): 检索查询问题
+        vector_dimension (int): 向量维度大小
+        mode (RetrievalMode): 检索模式 ("dense", "semantic", "hybrid")
+        max_tokens (int): 最大 Token 预算 limit
+        result_limit (int | None): 返回最大条数
+
+    Returns:
+        dict[str, Any]: {"mode": mode, "retrieved_tokens": used_tokens, "sources": selected}
+    """
     if result_limit is None:
         result_limit = min(64, max(12, math.ceil(max_tokens / 256)))
     query_vector = (await embed_texts([query_text], vector_dimension))[0]
@@ -278,6 +312,14 @@ async def retrieve_context(
 
 
 def format_rag_prompt(retrieval: dict[str, Any]) -> str:
+    """将 RAG 检索结果拼接为注入 Prompt 的标准结构化字符串
+
+    Args:
+        retrieval (dict[str, Any]): 检索得到的 sources 数据
+
+    Returns:
+        str: 包含 [资料 N] 格式的 Prompt 指令字符串
+    """
     sources = retrieval["sources"]
     if not sources:
         return (

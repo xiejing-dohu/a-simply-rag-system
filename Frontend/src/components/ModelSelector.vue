@@ -1,3 +1,4 @@
+<!-- LLM 模型选择器下拉框组件 -->
 <template>
   <el-select
     v-model="selectedModel"
@@ -26,10 +27,12 @@ import { getModels } from '../api/model'
 import type { ModelInfo } from '../types'
 import { useChatStore } from '../stores/chat'
 
+// 可用模型列表
 const models = ref<ModelInfo[]>([])
 const chatStore = useChatStore()
 const selectedModel = ref(chatStore.currentModel)
 
+// 组件挂载时拉取系统可用模型列表并自动对齐当前选中的模型
 onMounted(async () => {
   try {
     const res = await getModels()
@@ -52,6 +55,7 @@ onMounted(async () => {
   }
 })
 
+/** 模型下拉框选择事件回调 */
 const handleChange = (val: string) => {
   if (chatStore.currentConversation) {
     chatStore.switchModel(chatStore.currentConversation.id, val)

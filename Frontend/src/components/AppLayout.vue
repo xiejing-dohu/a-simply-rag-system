@@ -1,3 +1,4 @@
+<!-- 全局应用顶层布局组件：顶部导航栏 + 侧边与中心内容区 -->
 <template>
   <div class="app-layout">
     <nav class="navbar glass-card">
@@ -13,6 +14,7 @@
         </div>
       </div>
       <div class="nav-right">
+        <!-- Token 消费面板 -->
         <TokenUsagePopover />
         <div class="user-info">
           <el-avatar :size="32" src="https://cube.elemecdn.com/3/7c/3ea6beec64369c2642b92c6726f1epng.png" />
@@ -41,8 +43,10 @@ import TokenUsagePopover from './TokenUsagePopover.vue'
 const authStore = useAuthStore()
 const router = useRouter()
 
+// 组件挂载时拉取最新用户信息及 Token 限额
 onMounted(() => authStore.fetchUser())
 
+/** 退出登录按钮句柄 */
 const handleLogout = () => {
   authStore.logout()
   router.push('/login')
@@ -100,12 +104,12 @@ const handleLogout = () => {
 
 .nav-link:hover {
   color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--bg-hover);
 }
 
 .nav-link.active {
-  color: var(--color-primary);
-  background: rgba(102, 126, 234, 0.1);
+  color: var(--color-primary-strong);
+  background: var(--bg-active);
 }
 
 .nav-right {

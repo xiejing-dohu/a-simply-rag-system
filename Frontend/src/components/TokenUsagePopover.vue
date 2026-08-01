@@ -1,3 +1,4 @@
+<!-- Token 用量详情及额度倒计时 Popover 弹窗组件 -->
 <template>
   <el-popover placement="bottom-end" :width="380" trigger="click" @show="authStore.fetchUser">
     <template #reference>
@@ -16,6 +17,7 @@
         <el-tag effect="dark" type="info">{{ overallMode }}</el-tag>
       </div>
 
+      <!-- 历史累计输入/输出 -->
       <div class="lifetime-grid">
         <div>
           <span>累计输入</span>
@@ -27,6 +29,7 @@
         </div>
       </div>
 
+      <!-- 5 小时滑动窗口 Token 消费进度 -->
       <section class="window-section">
         <div class="window-header">
           <div>
@@ -46,6 +49,7 @@
         <p>重置时间：{{ formatTime(user.five_hour_resets_at) }}</p>
       </section>
 
+      <!-- 周 7 天滑动窗口 Token 消费进度 -->
       <section class="window-section">
         <div class="window-header">
           <div>
@@ -77,18 +81,29 @@ const authStore = useAuthStore()
 const user = computed(() => authStore.user)
 const tokenFormatter = new Intl.NumberFormat('zh-CN')
 
+// 格式化数字千分位
 const formatTokens = (value: number) => tokenFormatter.format(value || 0)
+
+// 格式化限额字符串
 const formatQuota = (used: number, limit: number | null) => {
   return limit === null
     ? `${formatTokens(used)} / 无限`
     : `${formatTokens(used)} / ${formatTokens(limit)}`
 }
+
+// 格式化重置时间戳
 const formatTime = (value: string) => new Date(value).toLocaleString()
+
+// 计算已消费百分比
 const quotaPercent = (used: number, limit: number) => {
   if (limit <= 0) return 100
   return Math.min(100, Math.round((used / limit) * 100))
 }
+
+// 超额预警状态
 const quotaStatus = (used: number, limit: number) => used >= limit ? 'exception' : undefined
+
+// 全局模式提示
 const overallMode = computed(() => {
   if (!user.value) return ''
   return user.value.five_hour_token_limit === null && user.value.weekly_token_limit === null

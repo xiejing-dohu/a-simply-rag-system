@@ -1,3 +1,5 @@
+/** 知识库、文档解析与 Milvus 探测 API 模块 */
+
 import request from './request'
 import type {
   EmbeddingConfig,
@@ -9,14 +11,17 @@ import type {
   VectorOperation
 } from '../types'
 
+/** 获取系统 Embedding 配置 */
 export const getEmbeddingConfig = () => {
   return request.get<EmbeddingConfig>('/knowledge-bases/embedding-config')
 }
 
+/** 获取知识库列表 */
 export const getKnowledgeBases = () => {
   return request.get<KnowledgeBase[]>('/knowledge-bases/')
 }
 
+/** 创建新知识库 */
 export const createKnowledgeBase = (data: {
   name: string
   description?: string
@@ -25,16 +30,19 @@ export const createKnowledgeBase = (data: {
   return request.post<KnowledgeBase>('/knowledge-bases/', data)
 }
 
+/** 删除知识库 */
 export const deleteKnowledgeBase = (id: number) => {
   return request.delete<{ status: string, operation: VectorOperation }>(
     `/knowledge-bases/${id}`
   )
 }
 
+/** 查询向量 Outbox 异步任务状态 */
 export const getVectorOperation = (operationId: string) => {
   return request.get<VectorOperation>(`/knowledge-bases/operations/${operationId}`)
 }
 
+/** 上传文档并开始切片与向量化 */
 export const uploadDocument = (
   kbId: number,
   file: File,
@@ -52,18 +60,22 @@ export const uploadDocument = (
   )
 }
 
+/** 查询文档处理异步任务进度 */
 export const getDocumentTask = (taskId: string) => {
   return request.get<DocumentTask>(`/knowledge-bases/tasks/${taskId}`)
 }
 
+/** 获取知识库已导入文档列表 */
 export const getDocuments = (kbId: number) => {
   return request.get<KnowledgeDocument[]>(`/knowledge-bases/${kbId}/documents/`)
 }
 
+/** 探测获取 Milvus 集合的 Schema 字段信息 */
 export const getMilvusSchema = (kbId: number) => {
   return request.get<MilvusSchema>(`/knowledge-bases/${kbId}/milvus/schema`)
 }
 
+/** 分页游标获取 Milvus 存储的向量切片记录 */
 export const getMilvusChunks = (
   kbId: number,
   offset = 0,

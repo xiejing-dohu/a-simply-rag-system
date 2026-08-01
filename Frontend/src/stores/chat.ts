@@ -1,3 +1,5 @@
+/** 对话、历史消息列表与 RAG 检索参数 Pinia 状态管理模块 */
+
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import {
@@ -15,21 +17,32 @@ import type { Conversation, Message, RetrievalMode } from '../types'
 
 export const useChatStore = defineStore('chat', () => {
   const authStore = useAuthStore()
+  // 对话会话列表
   const conversations = ref<Conversation[]>([])
+  // 当前激活的会话对象
   const currentConversation = ref<Conversation | null>(null)
+  // 当前激活会话的历史消息列表
   const messages = ref<Message[]>([])
+  // 当前选中的 LLM 模型 ID
   const currentModel = ref<string>('')
+  // 当前关联选中的知识库 ID
   const currentKnowledgeBase = ref<number | null>(null)
+  // 是否开启 RAG 检索增强
   const ragEnabled = ref(false)
+  // 检索模式 ("semantic" | "dense" | "hybrid")
   const retrievalMode = ref<RetrievalMode>('semantic')
+  // 最大检索上下文 Token 限制
   const maxRetrievalTokens = ref(2048)
+  // 是否正在流式接收模型生成文本
   const isStreaming = ref(false)
 
+  /** 加载用户所有对话会话 */
   const fetchConversations = async () => {
     const res = await getConversations()
     conversations.value = res.data
   }
 
+  /** 创建新的对话会话 */
   const createConversationAction = async (title: string) => {
     if (!currentModel.value) {
       const modelResponse = await getModels()
@@ -49,6 +62,7 @@ export const useChatStore = defineStore('chat', () => {
     return res.data
   }
 
+  /** 删除指定对话 */
   const deleteConversationAction = async (id: number) => {
     await deleteConversation(id)
     conversations.value = conversations.value.filter(c => c.id !== id)
@@ -58,11 +72,13 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  /** 获取某个会话下的历史消息记录 */
   const fetchMessages = async (id: number) => {
     const res = await getMessages(id)
     messages.value = res.data
   }
 
+  /** 切换使用的大语言模型 */
   const switchModel = async (conversationId: number, modelName: string) => {
     await updateModel(conversationId, modelName)
     currentModel.value = modelName
@@ -70,6 +86,7 @@ export const useChatStore = defineStore('chat', () => {
     if (conv) conv.model_name = modelName
   }
 
+  /** 载入会话关联的 RAG 配置 */
   const loadConversationSettings = (conversation: Conversation) => {
     currentKnowledgeBase.value = conversation.knowledge_base_id
     ragEnabled.value = conversation.rag_enabled
@@ -77,6 +94,7 @@ export const useChatStore = defineStore('chat', () => {
     maxRetrievalTokens.value = conversation.max_retrieval_tokens
   }
 
+  /** 保存并更新当前会话的 RAG 配置 */
   const saveRagSettings = async () => {
     if (!currentConversation.value) return
     await updateRagSettings(currentConversation.value.id, {
@@ -93,10 +111,11 @@ export const useChatStore = defineStore('chat', () => {
     })
   }
 
+  /** 发送消息并渲染 SSE 实时打字效果 */
   const sendMessageAction = async (content: string) => {
     if (!currentConversation.value) return
 
-    // 添加用户消息
+    // 先在界面追加用户消息
     const tempId = Date.now()
     messages.value.push({
       id: tempId,
@@ -106,7 +125,7 @@ export const useChatStore = defineStore('chat', () => {
       created_at: new Date().toISOString()
     })
 
-    // 添加 AI 占位消息
+    // 追加 AI 占位消息
     const aiMessageId = tempId + 1
     const aiMessage: Message = {
       id: aiMessageId,

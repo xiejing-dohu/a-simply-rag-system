@@ -37,6 +37,7 @@ src/
 │   ├── chat.ts          # 会话、RAG 设置、SSE 流式聊天
 │   ├── knowledge.ts     # 知识库、上传、Milvus 数据浏览
 │   └── model.ts         # 聊天模型发现
+├── config/runtime.ts    # Vite 运行时配置和 API 根地址
 ├── components/
 │   ├── AppLayout.vue
 │   ├── ChatMessage.vue
@@ -47,7 +48,12 @@ src/
 │   ├── auth.ts
 │   ├── chat.ts
 │   └── knowledge.ts
-├── types/index.ts       # 接口响应的 TypeScript 类型
+├── types/
+│   ├── auth.ts          # 用户、登录和 Token 类型
+│   ├── chat.ts          # 会话、消息和 RAG 类型
+│   ├── knowledge.ts     # 知识库、任务和 Milvus 类型
+│   ├── model.ts         # 模型类型
+│   └── index.ts         # 统一导出，保持现有 import 兼容
 └── views/
     ├── LoginView.vue
     ├── ChatView.vue

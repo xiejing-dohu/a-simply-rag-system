@@ -6,12 +6,52 @@
   box-sizing: border-box;
 }
 
+html {
+  color-scheme: dark;
+  background: var(--bg-dark);
+}
+
 body {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
-  background-color: var(--bg-dark);
+  font-family: Inter, 'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei',
+    'PingFang SC', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 15px;
+  font-weight: 400;
+  background:
+    radial-gradient(circle at 15% -10%, rgba(112, 148, 255, 0.13), transparent 34rem),
+    radial-gradient(circle at 95% 105%, rgba(167, 123, 243, 0.1), transparent 32rem),
+    var(--bg-dark);
   color: var(--text-primary);
-  line-height: 1.5;
+  line-height: 1.6;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+a {
+  color: var(--color-primary-strong);
+}
+
+::selection {
+  color: #fff;
+  background: rgba(112, 148, 255, 0.55);
 }
 
 /* 滚动条美化 */
@@ -25,12 +65,12 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(184, 197, 214, 0.34);
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.3);
+  background: rgba(184, 197, 214, 0.5);
 }
 
 /* 渐变文本通用类 */
@@ -44,10 +84,11 @@ body {
 /* 玻璃拟态卡片通用类 */
 .glass-card {
   background: var(--bg-glass);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
 }
 
 /* 通用动画 */
@@ -78,13 +119,36 @@ body {
 /* Element Plus 暗色主题覆盖 */
 :root {
   --el-color-primary: var(--color-primary) !important;
+  --el-color-primary-light-3: #a9bcff !important;
+  --el-color-primary-light-5: #718bd8 !important;
+  --el-color-primary-light-7: #455d99 !important;
+  --el-color-primary-light-8: #344876 !important;
+  --el-color-primary-light-9: #243755 !important;
+  --el-color-primary-dark-2: #6689f0 !important;
   --el-bg-color: var(--bg-card) !important;
-  --el-bg-color-overlay: var(--bg-panel) !important;
+  --el-bg-color-page: var(--bg-dark) !important;
+  --el-bg-color-overlay: var(--bg-card) !important;
+  --el-fill-color: #223451 !important;
+  --el-fill-color-light: #1d2e49 !important;
+  --el-fill-color-lighter: #192943 !important;
+  --el-fill-color-extra-light: #15243a !important;
+  --el-fill-color-dark: #0d192a !important;
+  --el-fill-color-darker: #091321 !important;
+  --el-fill-color-blank: var(--bg-panel) !important;
   --el-text-color-primary: var(--text-primary) !important;
-  --el-text-color-regular: var(--text-secondary) !important;
+  --el-text-color-regular: var(--text-regular) !important;
+  --el-text-color-secondary: var(--text-secondary) !important;
+  --el-text-color-placeholder: var(--text-muted) !important;
+  --el-text-color-disabled: #71839a !important;
   --el-border-color: var(--border-color) !important;
-  --el-border-color-light: var(--border-color) !important;
-  --el-border-color-lighter: rgba(255, 255, 255, 0.05) !important;
+  --el-border-color-light: rgba(174, 190, 211, 0.2) !important;
+  --el-border-color-lighter: rgba(174, 190, 211, 0.15) !important;
+  --el-border-color-extra-light: rgba(174, 190, 211, 0.1) !important;
+  --el-border-color-dark: var(--border-color-strong) !important;
+  --el-disabled-bg-color: #132035 !important;
+  --el-disabled-text-color: #75869b !important;
+  --el-mask-color: rgba(2, 8, 18, 0.72) !important;
+  --el-box-shadow-light: var(--shadow-md) !important;
 }
 
 .el-button--primary {
@@ -92,5 +156,97 @@ body {
   border: none !important;
 }
 .el-button--primary:hover {
-  opacity: 0.9;
+  filter: brightness(1.08);
+}
+
+.el-button:not(.el-button--primary):not(.el-button--danger):not(.el-button--success):not(.el-button--warning):not(.el-button--info):not(.is-link) {
+  background-color: var(--bg-elevated);
+  border-color: var(--border-color);
+  color: var(--text-regular);
+}
+
+.el-button:not(.el-button--primary):not(.el-button--danger):not(.el-button--success):not(.el-button--warning):not(.el-button--info):not(.is-link):hover {
+  background-color: #263b5c;
+  border-color: var(--color-primary);
+  color: var(--text-primary);
+}
+
+.el-input__wrapper,
+.el-select__wrapper,
+.el-textarea__inner,
+.el-input-number,
+.el-upload-dragger {
+  background-color: var(--bg-panel) !important;
+  color: var(--text-primary) !important;
+  box-shadow: 0 0 0 1px var(--border-color) inset !important;
+}
+
+.el-input__wrapper:hover,
+.el-select__wrapper:hover,
+.el-textarea__inner:hover,
+.el-upload-dragger:hover {
+  box-shadow: 0 0 0 1px var(--border-color-strong) inset !important;
+}
+
+.el-input__wrapper.is-focus,
+.el-select__wrapper.is-focused,
+.el-textarea__inner:focus,
+.el-upload-dragger:focus-within {
+  box-shadow: 0 0 0 1px var(--color-primary) inset,
+    0 0 0 3px rgba(112, 148, 255, 0.16) !important;
+}
+
+.el-input__inner,
+.el-textarea__inner,
+.el-select__selected-item,
+.el-input-number .el-input__inner {
+  color: var(--text-primary) !important;
+}
+
+.el-input__inner::placeholder,
+.el-textarea__inner::placeholder {
+  color: var(--text-muted) !important;
+  opacity: 1;
+}
+
+.el-dialog,
+.el-drawer,
+.el-popper,
+.el-message-box {
+  background: var(--bg-card) !important;
+  border: 1px solid var(--border-color) !important;
+  color: var(--text-regular) !important;
+}
+
+.el-dialog__title,
+.el-drawer__title,
+.el-form-item__label,
+.el-table,
+.el-table th.el-table__cell {
+  color: var(--text-primary) !important;
+}
+
+.el-radio-button__inner {
+  background: var(--bg-panel) !important;
+  border-color: var(--border-color) !important;
+  color: var(--text-regular) !important;
+}
+
+.el-radio-button__original-radio:checked + .el-radio-button__inner {
+  background: var(--color-primary) !important;
+  border-color: var(--color-primary) !important;
+  color: #08111f !important;
+  font-weight: 600;
+}
+
+.el-radio-button.is-active .el-radio-button__inner {
+  background: var(--color-primary) !important;
+  border-color: var(--color-primary) !important;
+  color: #08111f !important;
+  font-weight: 600;
+}
+
+.el-message {
+  background: var(--bg-card) !important;
+  border-color: var(--border-color-strong) !important;
 }

@@ -1,6 +1,14 @@
+"""知识库运行时处理服务模块
+
+包含文档提取（支持 .docx, .xlsx, .csv, .txt, .md, .pdf 等格式）、
+基于 Tiktoken 的 Token 切片、Embedding 向量化提取 API 调用、
+以及 Milvus Collection 的创建、查询、删除与文档切片 Upsert/Delete 操作。
+"""
+
 from __future__ import annotations
 
 import io
+import hashlib
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,24 +30,38 @@ from pymilvus import (
     utility,
 )
 
-
+# 支持上传解析的文件后缀集合
 SUPPORTED_EXTENSIONS = {".docx", ".xlsx", ".xls", ".csv", ".txt", ".md", ".pdf"}
+# DashScope 推荐支持的向量维度
 DASHSCOPE_DIMENSIONS = [64, 128, 256, 512, 768, 1024, 1536, 2048]
 
 
 class KnowledgeProcessingError(RuntimeError):
+    """知识库处理基础异常类"""
     pass
 
 
 class EmbeddingServiceError(KnowledgeProcessingError):
+    """Embedding 服务生成向量失败异常"""
     pass
 
 
 class TransientEmbeddingError(RuntimeError):
+    """Embedding 暂态网络/服务不可用异常"""
+    pass
+
+
+class LegacyCollectionSchemaError(KnowledgeProcessingError):
+    """旧版无法保证幂等的 Milvus Schema 异常"""
     pass
 
 
 def embedding_config() -> dict[str, Any]:
+    """获取当前系统配置的 Embedding 模型与维度支持信息
+
+    Returns:
+        dict[str, Any]: 模型元数据字典
+    """
     model = os.getenv("EMBEDDING_MODEL", "").strip()
     api_base = os.getenv("OPENAI_API_BASE", "").strip()
     dimensions = DASHSCOPE_DIMENSIONS if "dashscope" in api_base.lower() else [256, 512, 768, 1024, 1536, 3072]
@@ -53,6 +75,7 @@ def embedding_config() -> dict[str, Any]:
 
 
 def _decode_text(content: bytes) -> str:
+    """尝试以 UTF-8-SIG, UTF-8, GB18030 等多种编码方式解码文本字节流"""
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
             return content.decode(encoding)
@@ -62,6 +85,7 @@ def _decode_text(content: bytes) -> str:
 
 
 def _stringify_cell(value: Any) -> str:
+    """将 Excel 单元格转换为干净的文本串"""
     if pd.isna(value):
         return ""
     if isinstance(value, float) and value.is_integer():
@@ -70,6 +94,7 @@ def _stringify_cell(value: Any) -> str:
 
 
 def _extract_excel(content: bytes) -> str:
+    """提取 Excel (.xlsx, .xls) 中所有 Sheet 表格的结构化文本"""
     try:
         workbook = pd.ExcelFile(io.BytesIO(content))
     except Exception as exc:
@@ -99,6 +124,17 @@ def _extract_excel(content: bytes) -> str:
 
 
 def extract_document(file_name: str, content: bytes) -> tuple[str, str]:
+    """主文档内容提取函数
+
+    根据文件后缀（TXT, MD, CSV, DOCX, XLSX, PDF）调用不同解析器提取纯文本。
+
+    Args:
+        file_name (str): 文件名称
+        content (bytes): 文件二进制流
+
+    Returns:
+        tuple[str, str]: (提取出的纯文本, 文件来源类型名)
+    """
     suffix = Path(file_name).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
         if suffix == ".doc":
@@ -137,6 +173,16 @@ def extract_document(file_name: str, content: bytes) -> tuple[str, str]:
 
 
 def split_text_by_tokens(text: str, chunk_tokens: int, overlap_tokens: int) -> list[dict[str, Any]]:
+    """使用 cl100k_base 编码器按指定的 Token 大小与 Overlap 滑动窗口切片文本
+
+    Args:
+        text (str): 待切片纯文本
+        chunk_tokens (int): 单个 Chunk 目标 Token 数量
+        overlap_tokens (int): 相邻 Chunk 间的重叠 Token 数量
+
+    Returns:
+        list[dict[str, Any]]: 切片字典列表 [{"text": "...", "token_count": 128}]
+    """
     if not 64 <= chunk_tokens <= 8192:
         raise KnowledgeProcessingError("切片 Token 数必须在 64 到 8192 之间")
     if overlap_tokens < 0 or overlap_tokens >= chunk_tokens:
@@ -160,6 +206,7 @@ def split_text_by_tokens(text: str, chunk_tokens: int, overlap_tokens: int) -> l
 
 
 def connect_milvus() -> None:
+    """建立与 Milvus 向量数据库的连接"""
     connections.connect(
         alias="default",
         host=os.getenv("MILVUS_HOST", "localhost"),
@@ -168,6 +215,12 @@ def connect_milvus() -> None:
 
 
 def create_collection(collection_name: str, vector_dimension: int) -> None:
+    """在 Milvus 中创建包含 Dense 向量与 BM25 稀疏向量的集合与索引结构
+
+    Args:
+        collection_name (str): 集合名称
+        vector_dimension (int): 密集向量维度
+    """
     connect_milvus()
     if utility.has_collection(collection_name):
         return
@@ -176,9 +229,12 @@ def create_collection(collection_name: str, vector_dimension: int) -> None:
         f"{os.getenv('MILVUS_PORT', '19530')}"
     )
     client = MilvusClient(uri=uri)
-    schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
+    schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
     schema.add_field(
-        field_name="id", datatype=DataType.INT64, is_primary=True, auto_id=True
+        field_name="id", datatype=DataType.INT64, is_primary=True, auto_id=False
+    )
+    schema.add_field(
+        field_name="document_id", datatype=DataType.VARCHAR, max_length=36
     )
     schema.add_field(
         field_name="text",
@@ -205,6 +261,7 @@ def create_collection(collection_name: str, vector_dimension: int) -> None:
         datatype=DataType.FLOAT_VECTOR,
         dim=vector_dimension,
     )
+    # 添加自动基于 text 生成 BM25 稀疏向量的 Function
     schema.add_function(
         Function(
             name="text_bm25",
@@ -234,17 +291,49 @@ def create_collection(collection_name: str, vector_dimension: int) -> None:
 
 
 def drop_collection(collection_name: str) -> None:
+    """删除指定的 Milvus 集合"""
     connect_milvus()
     if utility.has_collection(collection_name):
         utility.drop_collection(collection_name)
 
 
 def collection_exists(collection_name: str) -> bool:
+    """检查 Milvus 集合是否存在"""
     connect_milvus()
     return bool(utility.has_collection(collection_name))
 
 
+def require_idempotent_collection(collection_name: str) -> None:
+    """校验集合 Schema 是否支持幂等主键索引，拒绝自动 ID 的旧版 Collection"""
+    connect_milvus()
+    if not utility.has_collection(collection_name):
+        raise KnowledgeProcessingError("Milvus 集合不存在")
+    fields = {field.name: field for field in Collection(collection_name).schema.fields}
+    primary = next((field for field in fields.values() if field.is_primary), None)
+    if primary is None or primary.auto_id or "document_id" not in fields:
+        raise LegacyCollectionSchemaError(
+            "该知识库使用旧版 auto-ID Collection，无法保证幂等入库；"
+            "请新建知识库并迁移文档后再上传"
+        )
+
+
+def stable_chunk_id(document_id: str, chunk_index: int) -> int:
+    """利用 SHA256 为文档切片确定性地生成唯一正整数 INT64 主键"""
+    digest = hashlib.sha256(f"{document_id}:{chunk_index}".encode()).digest()
+    value = int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+    return value or 1
+
+
 async def embed_texts(texts: list[str], vector_dimension: int) -> list[list[float]]:
+    """批处理调用向量模型 API 为文本生成 embedding 向量
+
+    Args:
+        texts (list[str]): 文本块列表
+        vector_dimension (int): 预期返回向量维度
+
+    Returns:
+        list[list[float]]: 生成的浮点向量列表
+    """
     api_key = os.getenv("OPENAI_API_KEY", "").strip() or os.getenv("DASHSCOPE_API_KEY", "").strip()
     api_base = os.getenv("OPENAI_API_BASE", "").strip().rstrip("/")
     model = os.getenv("EMBEDDING_MODEL", "").strip()
@@ -317,13 +406,27 @@ def insert_chunks(
     document_name: str,
     source_type: str,
     uploaded_by: int,
+    document_id: str,
 ) -> list[int]:
+    """将文档切片及向量数据 upsert 覆盖插入 Milvus Collection
+
+    Returns:
+        list[int]: 生成的稳定主键 ID 列表
+    """
     connect_milvus()
+    require_idempotent_collection(collection_name)
+    if len(chunks) != len(vectors):
+        raise KnowledgeProcessingError("切片数量与向量数量不一致")
     collection = Collection(collection_name)
     timestamp = datetime.now(timezone.utc).isoformat()
-    result = collection.insert(
+    primary_keys = [
+        stable_chunk_id(document_id, index) for index in range(len(chunks))
+    ]
+    collection.upsert(
         [
             {
+                "id": primary_keys[index],
+                "document_id": document_id,
                 "text": chunk["text"],
                 "document_name": document_name,
                 "source_type": source_type,
@@ -337,10 +440,11 @@ def insert_chunks(
         ]
     )
     collection.flush()
-    return list(result.primary_keys)
+    return primary_keys
 
 
 def delete_chunks(collection_name: str, primary_keys: list[int]) -> None:
+    """按主键列表批量从 Milvus 中删除指定的切片向量"""
     if not primary_keys:
         return
     connect_milvus()
@@ -351,12 +455,14 @@ def delete_chunks(collection_name: str, primary_keys: list[int]) -> None:
 
 
 def _live_entity_count(collection: Collection) -> int:
+    """获取集合中实时存活的实体记录数量"""
     collection.load()
     result = collection.query(expr="", output_fields=["count(*)"])
     return int(result[0]["count(*)"]) if result else 0
 
 
 def collection_details(collection_name: str) -> dict[str, Any]:
+    """获取 Milvus 集合的详细结构、字段及索引列表"""
     connect_milvus()
     if not utility.has_collection(collection_name):
         raise KnowledgeProcessingError("Milvus 集合不存在")
@@ -389,24 +495,28 @@ def list_chunks(
     limit: int = 50,
     cursor: int | None = None,
 ) -> dict[str, Any]:
+    """游标/分页方式列出 Milvus 集合中已存储的文档切片列表"""
     connect_milvus()
     if not utility.has_collection(collection_name):
         raise KnowledgeProcessingError("Milvus 集合不存在")
     collection = Collection(collection_name)
     collection.load()
     total = _live_entity_count(collection)
+    output_fields = [
+        "id",
+        "text",
+        "document_name",
+        "source_type",
+        "chunk_index",
+        "token_count",
+        "uploaded_by",
+        "created_at",
+    ]
+    if any(field.name == "document_id" for field in collection.schema.fields):
+        output_fields.append("document_id")
     rows = collection.query(
         expr=f"id > {int(cursor)}" if cursor is not None else "id >= 0",
-        output_fields=[
-            "id",
-            "text",
-            "document_name",
-            "source_type",
-            "chunk_index",
-            "token_count",
-            "uploaded_by",
-            "created_at",
-        ],
+        output_fields=output_fields,
         offset=0 if cursor is not None else max(0, offset),
         limit=max(1, min(limit, 200)),
     )

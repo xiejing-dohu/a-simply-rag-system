@@ -1,3 +1,8 @@
+"""持久化与端到端功能测试模块
+
+包含用户 JWT 权限隔离、聊天会话级联删除、Token 额度超限封禁以及密码防爆破锁定测试。
+"""
+
 from __future__ import annotations
 
 import uuid
@@ -5,7 +10,7 @@ import uuid
 import pytest
 from sqlalchemy import delete, select
 
-from app.core.security import verify_token
+from app.core.security import normalize_username, verify_token
 from app.db.mysql import async_session_maker
 from app.db.redis import redis_client
 from app.models.conversation import Conversation
@@ -14,7 +19,14 @@ from app.models.user import User
 from app.state_repository import add_message, quota_state, record_token_usage
 
 
+def test_username_normalization_is_shared_by_case_and_whitespace_variants():
+    """测试用户名规范化防重名逻辑"""
+    assert normalize_username("  Alice.Admin  ") == "alice.admin"
+    assert normalize_username("ALICE.ADMIN") == "alice.admin"
+
+
 async def register(client, suffix: str, label: str) -> dict:
+    """辅助测试函数：注册测试用户"""
     response = await client.post(
         "/auth/register",
         json={
@@ -28,6 +40,7 @@ async def register(client, suffix: str, label: str) -> dict:
 
 
 async def login(client, username: str, password: str = "correct-password") -> dict:
+    """辅助测试函数：登录测试用户"""
     response = await client.post(
         "/auth/token",
         data={"username": username, "password": password},
@@ -38,6 +51,7 @@ async def login(client, username: str, password: str = "correct-password") -> di
 
 @pytest.mark.asyncio
 async def test_user_jwt_chat_isolation_and_quota_persist(api_client):
+    """测试用户数据隔离、JWT 解析与 Token 限额统计"""
     suffix = uuid.uuid4().hex[:12]
     first = await register(api_client, suffix, "alice")
     second = await register(api_client, suffix, "bob")
@@ -151,6 +165,7 @@ async def test_user_jwt_chat_isolation_and_quota_persist(api_client):
 
 @pytest.mark.asyncio
 async def test_conversation_delete_cascades_messages(api_client):
+    """测试删除对话会话自动级联删除关联消息功能"""
     suffix = uuid.uuid4().hex[:12]
     user = await register(api_client, suffix, "cascade")
     token = await login(api_client, user["username"])
@@ -188,17 +203,19 @@ async def test_conversation_delete_cascades_messages(api_client):
 
 @pytest.mark.asyncio
 async def test_password_failures_lock_for_five_minutes(api_client):
+    """测试连续三次输入错误密码触发 Redis 5分钟账户防爆破锁定机制"""
     suffix = uuid.uuid4().hex[:12]
-    user = await register(api_client, suffix, "lock")
+    user = await register(api_client, suffix, "LockCase")
     username = user["username"]
+    assert username == username.casefold()
     try:
         first = await api_client.post(
             "/auth/token",
-            data={"username": username, "password": "wrong-password"},
+            data={"username": f"  {username.upper()}  ", "password": "wrong-password"},
         )
         second = await api_client.post(
             "/auth/token",
-            data={"username": username, "password": "wrong-password"},
+            data={"username": username.title(), "password": "wrong-password"},
         )
         third = await api_client.post(
             "/auth/token",

@@ -1,3 +1,9 @@
+"""Rerank 重排序服务模块
+
+对初步检索得到的候选文档切片使用 Cross-Encoder / Reranker 模型（如 DashScope Qwen Rerank）
+进行精准相关性打分与重新排序。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -9,10 +15,12 @@ from app.core.config import settings
 
 
 class RerankServiceError(RuntimeError):
+    """Rerank 服务异常"""
     pass
 
 
 class TransientRerankError(RuntimeError):
+    """Rerank 暂态网络异常"""
     pass
 
 
@@ -21,7 +29,18 @@ async def rerank_candidates(
     candidates: list[dict[str, Any]],
     limit: int,
 ) -> list[dict[str, Any]]:
+    """调用 Rerank 模型重新打分候选文档
+
+    Args:
+        query (str): 用户查询问题
+        candidates (list[dict[str, Any]]): 粗筛出来的候选文档列表
+        limit (int): 截取的最大返回数量
+
+    Returns:
+        list[dict[str, Any]]: 按重排序得分由高到低排列的文档列表
+    """
     provider = settings.RERANK_PROVIDER.strip().lower()
+    # 如果未开启 Rerank 或候选集为空，直接返回前 limit 个结果
     if provider in {"", "none", "disabled"} or not candidates:
         return candidates[:limit]
     if provider != "dashscope":

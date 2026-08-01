@@ -1,3 +1,4 @@
+<!-- 智能聊天对话主页面组件：包含侧边会话切换、模型与 RAG 参数调节、打字机流式聊天界面 -->
 <template>
   <div class="chat-container">
     <!-- 左侧会话列表 -->
@@ -38,10 +39,12 @@
           <h2>{{ chatStore.currentConversation?.title || '未选择会话' }}</h2>
         </div>
         <div class="header-right" v-if="chatStore.currentConversation">
+          <!-- 模型选择器 -->
           <ModelSelector />
         </div>
       </header>
 
+      <!-- RAG 检索配置栏 -->
       <section v-if="chatStore.currentConversation" class="rag-settings glass-card">
         <div class="rag-switch">
           <span>启用 RAG</span>
@@ -93,6 +96,7 @@
         </el-button>
       </section>
 
+      <!-- 消息列表滚动区域 -->
       <div class="messages-area" ref="messagesArea">
         <div v-if="!chatStore.currentConversation" class="empty-state fade-in">
           <div class="icon-wrapper">
@@ -110,6 +114,7 @@
         </template>
       </div>
 
+      <!-- 底部输入框 -->
       <div class="input-area" v-if="chatStore.currentConversation">
         <div class="input-wrapper glass-card">
           <el-input
@@ -149,6 +154,8 @@ const kbStore = useKnowledgeStore()
 const inputMsg = ref('')
 const messagesArea = ref<HTMLElement | null>(null)
 const savingRag = ref(false)
+
+// 过滤状态为 active 可用的知识库列表
 const activeKnowledgeBases = computed(() =>
   kbStore.knowledgeBases.filter(item => item.status === 'active')
 )
@@ -158,6 +165,7 @@ onMounted(() => {
   kbStore.fetchKnowledgeBases()
 })
 
+/** 新建会话 */
 const handleNewChat = async () => {
   if (chatStore.ragEnabled && !chatStore.currentKnowledgeBase) {
     return ElMessage.warning('启用 RAG 前请选择知识库')
@@ -165,6 +173,7 @@ const handleNewChat = async () => {
   await chatStore.createConversation('新对话 ' + new Date().toLocaleString())
 }
 
+/** 切换激活的会话 */
 const selectConversation = async (conv: Conversation) => {
   chatStore.currentConversation = conv
   chatStore.currentModel = conv.model_name
@@ -173,15 +182,18 @@ const selectConversation = async (conv: Conversation) => {
   scrollToBottom()
 }
 
+/** 删除会话 */
 const handleDeleteChat = async (id: number) => {
   await chatStore.deleteConversation(id)
 }
 
+/** 回车键发送事件触发 */
 const handleEnter = (e: KeyboardEvent) => {
   if (e.shiftKey) return
   sendMsg()
 }
 
+/** 发送提问消息 */
 const sendMsg = async () => {
   if (!inputMsg.value.trim() || chatStore.isStreaming) return
   if (chatStore.ragEnabled && !chatStore.currentKnowledgeBase) {
@@ -193,6 +205,7 @@ const sendMsg = async () => {
   await chatStore.sendMessage(msg)
 }
 
+/** 保存与更新当前会话的 RAG 参数 */
 const saveRagSettings = async () => {
   savingRag.value = true
   try {
@@ -206,6 +219,7 @@ const saveRagSettings = async () => {
   }
 }
 
+/** 自动滚动到消息区域底部 */
 const scrollToBottom = async () => {
   await nextTick()
   if (messagesArea.value) {
@@ -213,6 +227,7 @@ const scrollToBottom = async () => {
   }
 }
 
+// 监听消息长度变化及流式打印过程中的增量自动底端对齐
 watch(() => chatStore.messages.length, scrollToBottom)
 watch(() => chatStore.messages[chatStore.messages.length - 1]?.content, () => {
   if (chatStore.isStreaming) {
@@ -267,12 +282,13 @@ watch(() => chatStore.messages[chatStore.messages.length - 1]?.content, () => {
 }
 
 .conv-item:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--bg-hover);
+  color: var(--text-primary);
 }
 
 .conv-item.active {
-  background: rgba(102, 126, 234, 0.1);
-  color: var(--color-primary);
+  background: var(--bg-active);
+  color: var(--color-primary-strong);
 }
 
 .conv-title {

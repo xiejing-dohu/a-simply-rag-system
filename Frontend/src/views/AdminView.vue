@@ -1,9 +1,11 @@
+<!-- 管理员控制台页面组件：提供账号管理、角色与激活状态切换、Token 限额配置及手动一键重置 -->
 <template>
   <div class="admin-container">
     <div class="header">
       <h1 class="text-gradient">用户管理</h1>
     </div>
 
+    <!-- 用户列表表格 -->
     <div class="table-wrapper glass-card slide-up">
       <el-table :data="users" style="width: 100%" class="custom-table">
         <el-table-column prop="username" label="用户名" />
@@ -65,6 +67,7 @@
       </el-table>
     </div>
 
+    <!-- Token 额度编辑与重置弹窗 -->
     <el-dialog v-model="quotaVisible" :title="`Token 配额 · ${quotaUser?.username || ''}`" width="560px">
       <div v-if="quotaUser" class="quota-dialog">
         <div class="usage-overview">
@@ -150,6 +153,7 @@ const replaceUser = (updated: User) => {
   if (quotaUser.value?.id === updated.id) quotaUser.value = updated
 }
 
+/** 加载用户列表 */
 const fetchUsers = async () => {
   try {
     const res = await getUsers()
@@ -163,16 +167,18 @@ onMounted(() => {
   fetchUsers()
 })
 
+/** 修改用户激活状态开关回调 */
 const handleStatusChange = async (id: number, val: string | number | boolean) => {
   try {
     await updateUser(id, { is_active: Boolean(val) })
     ElMessage.success('状态已更新')
   } catch (e) {
     ElMessage.error('更新失败')
-    fetchUsers() // 恢复
+    fetchUsers()
   }
 }
 
+/** 修改用户角色回调 */
 const handleRoleChange = async (id: number, role: string) => {
   try {
     await updateUser(id, { role: role as 'admin' | 'employee' })
@@ -183,6 +189,7 @@ const handleRoleChange = async (id: number, role: string) => {
   }
 }
 
+/** 打开 Token 配额配置对话框 */
 const openQuotaDialog = (user: User) => {
   quotaUser.value = user
   fiveHourUnlimited.value = user.five_hour_token_limit === null
@@ -192,6 +199,7 @@ const openQuotaDialog = (user: User) => {
   quotaVisible.value = true
 }
 
+/** 保存更新后的 Token 配额限制 */
 const saveQuota = async () => {
   if (!quotaUser.value) return
   quotaSaving.value = true
@@ -210,6 +218,7 @@ const saveQuota = async () => {
   }
 }
 
+/** 管理员重置指定用户的 Token 消耗 */
 const handleResetUsage = async (scope: TokenUsageResetScope) => {
   if (!quotaUser.value) return
   try {
